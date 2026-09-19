@@ -1,0 +1,29 @@
+[package]
+name = "fyrox-gfx"
+version = "0.1.0"
+edition = "2021"
+description = "Graphics improvements for Fyrox that live outside the engine: refractive glass, and more to come."
+license = "MIT"
+
+# Not part of any game's workspace on purpose: a game picks the engine backend, and this crate
+# follows whatever it picked.
+[workspace]
+
+[dependencies]
+# No default features: the game using this crate decides between OpenGL and wgpu (Vulkan).
+fyrox = { path = "../Fyrox/fyrox", default-features = false }
+
+# Ray tracing lives in the wgpu backend, because that is where the device and the acceleration
+# structures are. Games on OpenGL simply do not enable this feature.
+fyrox-graphics-wgpu = { path = "../Fyrox/fyrox-graphics-wgpu", optional = true }
+
+[features]
+raytracing = ["dep:fyrox-graphics-wgpu", "fyrox/backend_wgpu"]
+
+[dev-dependencies]
+fyrox = { path = "../Fyrox/fyrox", default-features = false, features = ["backend_wgpu"] }
+fyrox-graphics-wgpu = { path = "../Fyrox/fyrox-graphics-wgpu" }
+
+[[example]]
+name = "glass"
+required-features = []
