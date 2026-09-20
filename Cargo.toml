@@ -11,18 +11,18 @@ license = "MIT"
 
 [dependencies]
 # No default features: the game using this crate decides between OpenGL and wgpu (Vulkan).
-fyrox = { path = "../Fyrox/fyrox", default-features = false }
+fyrox = { git = "https://github.com/d4140n-4h3-1/Fyrox.git", branch = "vulkan", default-features = false }
 
 # Ray tracing lives in the wgpu backend, because that is where the device and the acceleration
 # structures are. Games on OpenGL simply do not enable this feature.
-fyrox-graphics-wgpu = { path = "../Fyrox/fyrox-graphics-wgpu", optional = true }
+fyrox-graphics-wgpu = { git = "https://github.com/d4140n-4h3-1/Fyrox.git", branch = "vulkan", optional = true }
 
 [features]
 raytracing = ["dep:fyrox-graphics-wgpu", "fyrox/backend_wgpu"]
 
 [dev-dependencies]
-fyrox = { path = "../Fyrox/fyrox", default-features = false, features = ["backend_wgpu"] }
-fyrox-graphics-wgpu = { path = "../Fyrox/fyrox-graphics-wgpu" }
+fyrox = { git = "https://github.com/d4140n-4h3-1/Fyrox.git", branch = "vulkan", default-features = false, features = ["backend_wgpu"] }
+fyrox-graphics-wgpu = { git = "https://github.com/d4140n-4h3-1/Fyrox.git", branch = "vulkan" }
 
 [[example]]
 name = "glass"
