@@ -11,6 +11,8 @@
 //! - [`occlusion`]: how far ambient occlusion reaches, which is what keeps corners from going
 //!   flat. On by default, at the engine's own strength.
 //! - [`reflections`]: ray-marched against the depth buffer. Off by default.
+//! - [`moving`]: what in the scene moves, which the game tells the effects every frame so that
+//!   temporal anti-aliasing does not leave a ghost behind it.
 //! - [`shadows::ShadowBudget`]: keeps shadow maps for the lights nearest the camera only, which is
 //!   what makes a scene full of small lamps affordable. On by default, and idle while shadows are
 //!   traced, since then there are no shadow maps to budget.
@@ -36,6 +38,7 @@
 //! that is on for games that want reflections everywhere.
 
 pub mod antialiasing;
+pub mod moving;
 pub mod occlusion;
 #[cfg(feature = "raytracing")]
 pub mod raytraced_shadows;
@@ -46,6 +49,7 @@ pub mod shadows;
 pub mod temporal;
 
 pub use antialiasing::AntiAliasing;
+pub use moving::{MovingThing, MovingThings};
 pub use occlusion::AmbientOcclusion;
 #[cfg(feature = "raytracing")]
 pub use raytraced_shadows::RayTracedShadows;
@@ -92,6 +96,10 @@ pub struct GraphicsEffects {
     #[visit(skip)]
     #[reflect(hidden)]
     temporal_pass: Option<Rc<RefCell<temporal::TemporalPass>>>,
+    /// What moves, as the game says.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    moving: MovingThings,
     /// Frames drawn with temporal anti-aliasing, which picks each frame's shift of the view.
     #[visit(skip)]
     #[reflect(hidden)]
@@ -121,6 +129,7 @@ impl Default for GraphicsEffects {
             reflections: None,
             reflection_pass: None,
             temporal_pass: None,
+            moving: MovingThings::default(),
             temporal_frame: 0,
             #[cfg(feature = "raytracing")]
             ray_traced_shadows: None,
@@ -130,6 +139,13 @@ impl Default for GraphicsEffects {
 }
 
 impl GraphicsEffects {
+    /// The list of what moves in the scene, for the game to keep up to date every frame - see
+    /// [`moving`]. The effects share it, so a copy taken before the plugin is handed to the
+    /// executor stays connected.
+    pub fn moving_things(&self) -> MovingThings {
+        self.moving.clone()
+    }
+
     /// Leaves shadow settings as the game set them.
     pub fn without_soft_shadows(mut self) -> Self {
         self.soft_shadows = None;
@@ -258,7 +274,10 @@ impl Plugin for GraphicsEffects {
             }
             if temporal {
                 // Last, so it smooths everything drawn before it: glass and reflections too.
-                let pass = Rc::new(RefCell::new(temporal::TemporalPass::new(TypeId::of::<Self>())));
+                let pass = Rc::new(RefCell::new(temporal::TemporalPass::new(
+                    TypeId::of::<Self>(),
+                    self.moving.clone(),
+                )));
                 graphics_context.renderer.add_render_pass(pass.clone());
                 self.temporal_pass = Some(pass);
             }

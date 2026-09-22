@@ -35,6 +35,15 @@
                 // Start over from this frame alone: the view jumped, and the history shows
                 // somewhere else.
                 (name: "reset", kind: Bool(value: false)),
+                (name: "cameraPosition", kind: Vector4()),
+                // What moves (see `moving.rs`): each capsule's ends, its radius in the w of the
+                // first, and how far it moved since the frame before. A radius of zero is none.
+                (name: "moving0Bottom", kind: Vector4()),
+                (name: "moving0Top", kind: Vector4()),
+                (name: "moving0Moved", kind: Vector4()),
+                (name: "moving1Bottom", kind: Vector4()),
+                (name: "moving1Top", kind: Vector4()),
+                (name: "moving1Moved", kind: Vector4()),
             ]),
             binding: 0
         ),
@@ -98,6 +107,66 @@
                         return c / max(1.0 - max(c.r, max(c.g, c.b)), 1.0e-4);
                     }
 
+                    // How far `p` is from the segment from `a` to `b`.
+                    fn toSegment(p: vec3f, a: vec3f, b: vec3f) -> f32 {
+                        let ab = b - a;
+                        let t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1.0e-8), 0.0, 1.0);
+                        return length(p - (a + ab * t));
+                    }
+
+                    // How close the segments from `p1` to `q1` and from `p2` to `q2` come.
+                    fn betweenSegments(p1: vec3f, q1: vec3f, p2: vec3f, q2: vec3f) -> f32 {
+                        let d1 = q1 - p1;
+                        let d2 = q2 - p2;
+                        let r = p1 - p2;
+                        let a = dot(d1, d1);
+                        let e = dot(d2, d2);
+                        let f = dot(d2, r);
+                        let c = dot(d1, r);
+                        let b = dot(d1, d2);
+                        let denominator = a * e - b * b;
+                        var s = 0.0;
+                        if (denominator > 1.0e-8) {
+                            s = clamp((b * f - c * e) / denominator, 0.0, 1.0);
+                        }
+                        var t = (b * s + f) / max(e, 1.0e-8);
+                        if (t < 0.0) {
+                            t = 0.0;
+                            s = clamp(-c / max(a, 1.0e-8), 0.0, 1.0);
+                        } else if (t > 1.0) {
+                            t = 1.0;
+                            s = clamp((b - c) / max(a, 1.0e-8), 0.0, 1.0);
+                        }
+                        return length((p1 + d1 * s) - (p2 + d2 * t));
+                    }
+
+                    // Where a point on a moving thing was last frame, and whether the view to a
+                    // point passes close by one: past its edges the history may still show it.
+                    struct Moved {
+                        world: vec3f,
+                        on: bool,
+                        near: bool,
+                    };
+
+                    // How far outside a moving thing's capsule the view still counts as passing
+                    // close by it, in meters.
+                    const NEAR_MARGIN: f32 = 0.2;
+
+                    fn follow(moved: Moved, world: vec3f, bottom: vec4f, top: vec4f, by: vec4f) -> Moved {
+                        var result = moved;
+                        let radius = bottom.w;
+                        if (radius <= 0.0) {
+                            return result;
+                        }
+                        if (toSegment(world, bottom.xyz, top.xyz) < radius) {
+                            result.world = world - by.xyz;
+                            result.on = true;
+                        } else if (betweenSegments(properties.cameraPosition.xyz, world, bottom.xyz, top.xyz) < radius + NEAR_MARGIN) {
+                            result.near = true;
+                        }
+                        return result;
+                    }
+
                     fn current(uv: vec2f) -> vec3f {
                         return squeeze(textureSampleLevel(currentColor_tex, currentColor_samp, uv, 0.0).rgb);
                     }
@@ -125,12 +194,15 @@
                             }
                         }
 
-                        // Where this pixel's point was on screen last frame. Nothing in the
-                        // maze moves, so the depth buffer and the two camera positions are all
-                        // it takes.
+                        // Where this pixel's point was on screen last frame: from the depth buffer
+                        // and the two camera positions, and for a point on something that moves,
+                        // from where that was.
                         let depth = textureSampleLevel(sceneDepth_tex, sceneDepth_samp, uv + properties.jitterUv, 0);
                         let world = S_UnProject(vec3f(uv, depth), properties.inverseViewProjection);
-                        let previous = properties.previousViewProjection * vec4f(world, 1.0);
+                        var moved = Moved(world, false, false);
+                        moved = follow(moved, world, properties.moving0Bottom, properties.moving0Top, properties.moving0Moved);
+                        moved = follow(moved, world, properties.moving1Bottom, properties.moving1Top, properties.moving1Moved);
+                        let previous = properties.previousViewProjection * vec4f(moved.world, 1.0);
                         let previousNdc = previous.xy / previous.w;
                         // Render targets are stored top row first here, so v runs against y.
                         let previousUv = vec2f(previousNdc.x * 0.5 + 0.5, 0.5 - previousNdc.y * 0.5);
@@ -147,7 +219,17 @@
                         // and the history of what moved with the view would trail behind it.
                         // Fast motion hides aliasing anyway; it is smoothed again as it slows.
                         let motion = length((previousUv - uv) * properties.screenSize);
-                        let blend = mix(properties.blend, 0.5, clamp(motion / 10.0, 0.0, 1.0));
+                        var blend = mix(properties.blend, 0.5, clamp(motion / 10.0, 0.0, 1.0));
+                        // Past the edge of something moving, the history may still show it where
+                        // it was a moment ago: this frame counts for more, so nothing trails.
+                        if (moved.near) {
+                            blend = max(blend, 0.5);
+                        }
+                        // On it, its limbs move against it too, which following it as a whole
+                        // does not catch.
+                        if (moved.on) {
+                            blend = max(blend, 0.25);
+                        }
                         let result = select(mix(history, here, blend), here, fresh);
                         return vec4f(unsqueeze(result), 1.0);
                     }

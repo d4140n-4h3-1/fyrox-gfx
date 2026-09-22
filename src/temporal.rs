@@ -12,12 +12,19 @@
 //! Anything the history shows that this frame does not - something moved, or came into view - is
 //! pulled back to the colors around the pixel this frame, so it does not leave a trail.
 //!
+//! What the game says moves ([`crate::moving`]) is followed rather than taken to stand still: a
+//! point on it is looked up where it was last frame, before it moved, and the view past its edges,
+//! where the history may still show it, leans on this frame instead.
+//!
 //! [`Renderer::set_projection_jitter`]: fyrox::renderer::Renderer::set_projection_jitter
 
-use crate::scene_copy::SceneCopy;
+use crate::{
+    moving::{MovingThings, MAX_MOVING_THINGS},
+    scene_copy::SceneCopy,
+};
 use fyrox::{
     core::{
-        algebra::{Matrix4, Vector2, Vector3},
+        algebra::{Matrix4, Vector2, Vector3, Vector4},
         log::Log,
         pool::Handle,
         sstorage::ImmutableString,
@@ -81,6 +88,7 @@ pub struct TemporalPass {
     previous: Option<(Handle<Scene>, Handle<Node>, Matrix4<f32>, Vector3<f32>)>,
     /// This frame's shift of the view, in pixels, as handed to the renderer.
     jitter: Vector2<f32>,
+    moving: MovingThings,
 }
 
 impl std::fmt::Debug for TemporalPass {
@@ -92,7 +100,7 @@ impl std::fmt::Debug for TemporalPass {
 }
 
 impl TemporalPass {
-    pub fn new(source_type_id: TypeId) -> Self {
+    pub fn new(source_type_id: TypeId, moving: MovingThings) -> Self {
         Self {
             source_type_id,
             pass_name: ImmutableString::new("Primary"),
@@ -104,6 +112,7 @@ impl TemporalPass {
             pixel_kind: None,
             previous: None,
             jitter: Vector2::zeros(),
+            moving,
         }
     }
 
@@ -206,6 +215,17 @@ impl SceneRenderPass for TemporalPass {
         // (so down the texture, which is stored top row first) as much.
         let jitter_uv = Vector2::new(shift.x * 0.5, -shift.y * 0.5);
         let world_view_projection = make_viewport_matrix(ctx.observer.viewport);
+        let camera = position.push(1.0);
+        // Each moving thing as the two ends of its capsule, the radius riding along with the
+        // first, and how far it moved. A radius of zero is no thing at all.
+        let mut moving = [[Vector4::zeros(); 3]; MAX_MOVING_THINGS];
+        for (slot, thing) in moving.iter_mut().zip(self.moving.get()) {
+            *slot = [
+                thing.bottom.push(thing.radius),
+                thing.top.push(0.0),
+                thing.moved.push(0.0),
+            ];
+        }
         let properties = PropertyGroup::from([
             property("worldViewProjection", &world_view_projection),
             property("inverseViewProjection", &inverse_view_projection),
@@ -214,6 +234,13 @@ impl SceneRenderPass for TemporalPass {
             property("jitterUv", &jitter_uv),
             property("blend", &BLEND),
             property("reset", &reset),
+            property("cameraPosition", &camera),
+            property("moving0Bottom", &moving[0][0]),
+            property("moving0Top", &moving[0][1]),
+            property("moving0Moved", &moving[0][2]),
+            property("moving1Bottom", &moving[1][0]),
+            property("moving1Top", &moving[1][1]),
+            property("moving1Moved", &moving[1][2]),
         ]);
         let material = RenderMaterial::from([
             binding(
