@@ -21,10 +21,13 @@
 //! to smooth out the differences between neighboring pixels. One ray per pixel gives hard shadows
 //! and skips the blur.
 //!
-//! What stands still is gathered once, and again whenever meshes are added or removed or one of
-//! them is found to have moved. What moves - skinned meshes, and any other mesh once it has moved -
-//! is gathered again every frame, wherever it is, skinned meshes in the pose they are drawn in, and
-//! traced along with the rest; hidden, it casts no shadow, as with shadow maps.
+//! Each mesh's triangles are put into the hardware's structure once, in the mesh's own space -
+//! once for every mesh made from the same surface data, such as a maze's repeated tiles - and every
+//! frame a copy of each is placed wherever its mesh is, so what moves casts its shadow from where
+//! it is. A skinned mesh's triangles are skinned by its bones every frame, as the renderer draws
+//! them, and refitted. Hidden meshes still cast shadows while they stand still, since a game hides
+//! what the camera cannot see; once a mesh has moved, or if it is skinned, it casts none while
+//! hidden, as with shadow maps.
 
 use fyrox::{
     core::{
@@ -51,9 +54,11 @@ use fyrox::{
         Scene,
     },
 };
-use std::hash::{Hash, Hasher};
 use fyrox_graphics_wgpu::{
-    raytracing::{RayTracedScene, ShadowRayLight, ShadowRayParameters, ShadowTracer},
+    raytracing::{
+        RayTracedGeometry, RayTracedInstance, RayTracedScene, ShadowRayLight,
+        ShadowRayParameters, ShadowTracer,
+    },
     server::WgpuGraphicsServer,
 };
 
@@ -129,47 +134,43 @@ fn casts_shadows(material: &MaterialResource) -> bool {
 /// How far a mesh may drift, in meters, before it counts as having moved.
 const MOVED: f32 = 1.0e-4;
 
-/// Whether a mesh is skinned, and so moves with its bones wherever its node is.
-fn is_skinned(mesh: &Mesh) -> bool {
-    mesh.surfaces().iter().any(|surface| !surface.bones().is_empty())
-}
-
 /// Whether `a` and `b` put things in the same place.
 fn same_place(a: &Matrix4<f32>, b: &Matrix4<f32>) -> bool {
     a.iter().zip(b.iter()).all(|(a, b)| (a - b).abs() <= MOVED)
 }
 
-/// Adds `surface`'s triangles to `vertices` and `indices`, in world space: moved by `transform`,
-/// or, skinned, by its bones in `graph`, as the renderer draws it.
-fn add_surface(
-    graph: &Graph,
-    surface: &Surface,
-    transform: &Matrix4<f32>,
-    vertices: &mut Vec<f32>,
-    indices: &mut Vec<u32>,
-) {
+/// `transform`'s top three rows, row by row, as an instance is placed with.
+fn instance_transform(transform: &Matrix4<f32>) -> [f32; 12] {
+    let mut out = [0.0; 12];
+    for row in 0..3 {
+        for column in 0..4 {
+            out[row * 4 + column] = transform[(row, column)];
+        }
+    }
+    out
+}
+
+/// `surface`'s vertex positions, three floats each: in its own space, or, skinned, where its
+/// bones in `graph` put them in the world, as the renderer draws it.
+fn positions(graph: &Graph, surface: &Surface) -> Vec<f32> {
     let bones: Vec<Matrix4<f32>> = surface
         .bones()
         .iter()
         .map(|&bone| {
-            graph
-                .try_get_node(bone)
-                .map_or(Matrix4::identity(), |bone| {
-                    bone.global_transform() * bone.inv_bind_pose_transform()
-                })
+            graph.try_get_node(bone).map_or(Matrix4::identity(), |bone| {
+                bone.global_transform() * bone.inv_bind_pose_transform()
+            })
         })
         .collect();
     let data = surface.data();
     let data = data.data_ref();
-    let base = (vertices.len() / 3) as u32;
-    let mut count = 0;
+    let mut out = Vec::with_capacity(data.vertex_buffer.vertex_count() as usize * 3);
     for vertex in data.vertex_buffer.iter() {
         let Ok(position) = vertex.read_3_f32(VertexAttributeUsage::Position) else {
             break;
         };
-        let point = Point3::from(position);
-        let world = if bones.is_empty() {
-            transform.transform_point(&point).coords
+        let point = if bones.is_empty() {
+            position
         } else {
             let (Ok(which), Ok(weights)) = (
                 vertex.read_4_u8(VertexAttributeUsage::BoneIndices),
@@ -180,76 +181,34 @@ fn add_surface(
             let mut world = Vector3::zeros();
             for (&bone, &weight) in which.iter().zip(weights.iter()) {
                 if let Some(matrix) = bones.get(bone as usize) {
-                    world += matrix.transform_point(&point).coords * weight;
+                    world += matrix.transform_point(&Point3::from(position)).coords * weight;
                 }
             }
             world
         };
-        vertices.extend_from_slice(&[world.x, world.y, world.z]);
-        count += 1;
+        out.extend_from_slice(&[point.x, point.y, point.z]);
     }
-    for triangle in data.geometry_buffer.iter() {
-        // Only whole triangles of the vertices read.
-        if triangle.0.iter().all(|&i| i < count) {
-            indices.extend_from_slice(&[base + triangle[0], base + triangle[1], base + triangle[2]]);
-        }
-    }
+    out
 }
 
-/// Every shadow-casting triangle of every mesh of the scene that stands still - all but `moving`
-/// - in world space, ready to be traced against; and where each of those meshes is, to tell
-/// when one moves.
-///
-/// Hidden meshes are included: a game hides what the camera cannot see so it is not drawn, but it
-/// is still there, and still stands between a light and whatever the camera does see.
-fn collect_still(
-    graph: &Graph,
-    moving: &FxHashSet<Handle<Node>>,
-) -> (Vec<f32>, Vec<u32>, FxHashMap<Handle<Node>, Matrix4<f32>>) {
-    let mut vertices: Vec<f32> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-    let mut places = FxHashMap::default();
-    for (handle, node) in graph.pair_iter() {
-        let Some(mesh) = node.cast::<Mesh>() else {
-            continue;
-        };
-        if !node.cast_shadows() || moving.contains(&handle) || is_skinned(mesh) {
-            continue;
-        }
-        let transform = node.global_transform();
-        places.insert(handle, transform);
-        for surface in mesh.surfaces() {
-            if casts_shadows(surface.material()) {
-                add_surface(graph, surface, &transform, &mut vertices, &mut indices);
-            }
-        }
-    }
-    (vertices, indices, places)
+/// `surface`'s triangles, as indices into the first `count` of its vertices: only whole ones.
+fn triangles(surface: &Surface, count: usize) -> Vec<u32> {
+    let data = surface.data();
+    let data = data.data_ref();
+    let count = count as u32;
+    data.geometry_buffer
+        .iter()
+        .filter(|triangle| triangle.0.iter().all(|&i| i < count))
+        .flat_map(|triangle| triangle.0)
+        .collect()
 }
 
-/// Every shadow-casting triangle of the meshes that move, where they are now: `moving`, and every
-/// skinned mesh. Only those showing, as a hidden mesh casts none from shadow maps either.
-fn collect_moving(graph: &Graph, moving: &FxHashSet<Handle<Node>>) -> (Vec<f32>, Vec<u32>) {
-    let mut vertices: Vec<f32> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-    for (handle, node) in graph.pair_iter() {
-        let Some(mesh) = node.cast::<Mesh>() else {
-            continue;
-        };
-        if !node.cast_shadows() || !node.global_visibility() {
-            continue;
-        }
-        if !moving.contains(&handle) && !is_skinned(mesh) {
-            continue;
-        }
-        let transform = node.global_transform();
-        for surface in mesh.surfaces() {
-            if casts_shadows(surface.material()) {
-                add_surface(graph, surface, &transform, &mut vertices, &mut indices);
-            }
-        }
-    }
-    (vertices, indices)
+/// Which geometry a surface is traced with: what it shares with every surface made from the same
+/// data, or, skinned, its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Shape {
+    Shared(u64),
+    Posed(Handle<Node>, usize),
 }
 
 /// Makes the renderer's shadows by tracing rays. [`crate::GraphicsEffects`] installs it.
@@ -257,13 +216,13 @@ pub struct TracedLightShadows {
     settings: RayTracedShadows,
     tracer: Option<ShadowTracer>,
     scene: Option<RayTracedScene>,
-    /// Which scene the structure was built from, and which meshes it had, so it is rebuilt when
-    /// the scene changes.
-    built_from: Option<(Handle<Scene>, u64)>,
-    /// Where each mesh standing still was when it was gathered, to tell when one moves; and the
-    /// meshes found to move, gathered every frame from then on.
+    /// Which scene it traces.
+    scene_handle: Option<Handle<Scene>>,
+    /// Each shape's geometry, built once, and posed geometry refitted every frame.
+    geometry: FxHashMap<Shape, RayTracedGeometry>,
+    /// Where each mesh was last frame, to tell when one moves; and the meshes that have.
     places: FxHashMap<Handle<Node>, Matrix4<f32>>,
-    moving: FxHashSet<Handle<Node>>,
+    moved: FxHashSet<Handle<Node>>,
     unsupported_reported: bool,
 }
 
@@ -272,6 +231,7 @@ impl std::fmt::Debug for TracedLightShadows {
         f.debug_struct("TracedLightShadows")
             .field("settings", &self.settings)
             .field("built", &self.scene.is_some())
+            .field("geometry", &self.geometry.len())
             .finish()
     }
 }
@@ -282,9 +242,10 @@ impl TracedLightShadows {
             settings,
             tracer: None,
             scene: None,
-            built_from: None,
+            scene_handle: None,
+            geometry: Default::default(),
             places: Default::default(),
-            moving: Default::default(),
+            moved: Default::default(),
             unsupported_reported: false,
         }
     }
@@ -311,51 +272,126 @@ impl LightShadowTracer for TracedLightShadows {
             return Ok(());
         }
 
-        // Which meshes there are, as one number. Counting them is not enough: a level torn down
-        // and replaced by another can have as many meshes as the last, in other places.
-        let meshes = {
-            let mut hasher = fyrox::fxhash::FxHasher64::default();
-            for (handle, node) in scene.graph.pair_iter() {
-                if node.cast::<Mesh>().is_some() {
-                    handle.hash(&mut hasher);
-                }
-            }
-            hasher.finish()
-        };
-        // A mesh that has moved since it was gathered moves from then on, and what stands still is
-        // gathered again without it.
+        if self.scene_handle != Some(scene_handle) {
+            self.scene = None;
+            self.geometry.clear();
+            self.places.clear();
+            self.moved.clear();
+            self.scene_handle = Some(scene_handle);
+        }
         let graph = &scene.graph;
-        let mut moved = false;
-        for (&handle, place) in &self.places {
-            if let Ok(node) = graph.try_get_node(handle) {
-                if !same_place(&node.global_transform(), place) {
-                    self.moving.insert(handle);
-                    moved = true;
+
+        // What each surface that casts shadows is traced with, where, and which surface it is; and
+        // posed vertices.
+        let mut placed: Vec<(Shape, [f32; 12], Handle<Node>, usize)> = Vec::new();
+        let mut posed: Vec<(Shape, Vec<f32>)> = Vec::new();
+        let mut places = FxHashMap::default();
+        for (handle, node) in graph.pair_iter() {
+            let Some(mesh) = node.cast::<Mesh>() else {
+                continue;
+            };
+            let transform = node.global_transform();
+            if self
+                .places
+                .get(&handle)
+                .is_some_and(|was| !same_place(was, &transform))
+            {
+                self.moved.insert(handle);
+            }
+            places.insert(handle, transform);
+            if !node.cast_shadows() {
+                continue;
+            }
+            let skinned = mesh.surfaces().iter().any(|s| !s.bones().is_empty());
+            if (skinned || self.moved.contains(&handle)) && !node.global_visibility() {
+                continue;
+            }
+            for (n, surface) in mesh.surfaces().iter().enumerate() {
+                if !casts_shadows(surface.material()) {
+                    continue;
+                }
+                if surface.bones().is_empty() {
+                    let shape = Shape::Shared(surface.data().key());
+                    placed.push((shape, instance_transform(&transform), handle, n));
+                } else {
+                    let shape = Shape::Posed(handle, n);
+                    posed.push((shape, positions(graph, surface)));
+                    placed.push((shape, instance_transform(&Matrix4::identity()), handle, n));
                 }
             }
         }
-        let changed = self.built_from != Some((scene_handle, meshes));
-        if changed || moved {
-            if self.built_from.is_some_and(|(built, _)| built != scene_handle) {
-                self.moving.clear();
+        self.places = places;
+        self.moved.retain(|handle| self.places.contains_key(handle));
+
+        // Geometry for shapes seen for the first time, and posed ones whose vertices changed in
+        // number.
+        let posed_vertices = |shape: &Shape| posed.iter().find(|(s, _)| s == shape).map(|(_, v)| v);
+        let mut built = 0;
+        for &(shape, _, handle, n) in &placed {
+            let fresh = match self.geometry.get(&shape) {
+                None => true,
+                Some(had) => posed_vertices(&shape)
+                    .is_some_and(|v| v.len() != had.vertex_count() as usize * 3),
+            };
+            if !fresh {
+                continue;
             }
-            // Only meshes still there.
-            self.moving.retain(|&handle| graph.try_get_node(handle).is_ok());
-            let (vertices, indices, places) = collect_still(graph, &self.moving);
-            self.scene = server.build_ray_traced_scene(&vertices, &indices)?;
-            self.places = places;
-            self.built_from = Some((scene_handle, meshes));
-            if let Some(scene) = self.scene.as_ref() {
+            let Some(surface) = graph
+                .try_get_node(handle)
+                .ok()
+                .and_then(|node| node.cast::<Mesh>())
+                .and_then(|mesh| mesh.surfaces().get(n))
+            else {
+                continue;
+            };
+            let vertices = match posed_vertices(&shape) {
+                Some(vertices) => vertices.clone(),
+                None => positions(graph, surface),
+            };
+            let indices = triangles(surface, vertices.len() / 3);
+            let updatable = matches!(shape, Shape::Posed(..));
+            if let Some(geometry) = server.build_ray_traced_geometry(&vertices, &indices, updatable)? {
+                self.geometry.insert(shape, geometry);
+                built += 1;
+            }
+        }
+        // Only what is still there.
+        self.geometry
+            .retain(|shape, _| placed.iter().any(|(s, ..)| s == shape));
+
+        // Posed geometry, refitted where it is this frame.
+        let updates: Vec<(&RayTracedGeometry, &[f32])> = posed
+            .iter()
+            .filter_map(|(shape, vertices)| {
+                let geometry = self.geometry.get(shape)?;
+                (vertices.len() == geometry.vertex_count() as usize * 3)
+                    .then_some((geometry, vertices.as_slice()))
+            })
+            .collect();
+        server.update_ray_traced_geometry(&updates)?;
+
+        let instances: Vec<RayTracedInstance> = placed
+            .iter()
+            .filter_map(|(shape, transform, ..)| {
+                Some(RayTracedInstance {
+                    geometry: self.geometry.get(shape)?,
+                    transform: *transform,
+                })
+            })
+            .collect();
+        match self.scene.as_mut() {
+            Some(traced) => server.update_ray_traced_instances(traced, &instances)?,
+            None => self.scene = server.build_ray_traced_instances(&instances)?,
+        }
+        if built > 0 {
+            if let Some(traced) = self.scene.as_ref() {
                 Log::info(format!(
-                    "Ray traced shadows: {} triangles standing still, {} meshes moving",
-                    scene.triangle_count(),
-                    self.moving.len()
+                    "Ray traced shadows: {} pieces of geometry, {} copies, {} triangles",
+                    self.geometry.len(),
+                    instances.len(),
+                    traced.triangle_count()
                 ));
             }
-        }
-        if let Some(traced) = self.scene.as_mut() {
-            let (vertices, indices) = collect_moving(graph, &self.moving);
-            server.set_moving_geometry(traced, &vertices, &indices)?;
         }
 
         if self.tracer.is_none() {

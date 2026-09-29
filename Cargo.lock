@@ -1568,7 +1568,7 @@ dependencies = [
 [[package]]
 name = "fyrox-core"
 version = "2.0.0-rc.1"
-source = "git+https://github.com/d4140n-4h3-1/Fyrox.git?branch=vulkan#9955c270f81789401b5d3e1193f6be730a366054"
+source = "git+https://github.com/d4140n-4h3-1/Fyrox.git?branch=vulkan#6a44772d1fe152ee4e5f5a864837afe3853c8e7e"
 dependencies = [
  "android-activity",
  "arrayvec",
@@ -1603,7 +1603,7 @@ dependencies = [
 [[package]]
 name = "fyrox-core-derive"
 version = "2.0.0-rc.1"
-source = "git+https://github.com/d4140n-4h3-1/Fyrox.git?branch=vulkan#9955c270f81789401b5d3e1193f6be730a366054"
+source = "git+https://github.com/d4140n-4h3-1/Fyrox.git?branch=vulkan#6a44772d1fe152ee4e5f5a864837afe3853c8e7e"
 dependencies = [
  "convert_case",
  "darling",
@@ -1634,7 +1634,7 @@ dependencies = [
 [[package]]
 name = "fyrox-graphics"
 version = "2.0.0-rc.1"
-source = "git+https://github.com/d4140n-4h3-1/Fyrox.git?branch=vulkan#9955c270f81789401b5d3e1193f6be730a366054"
+source = "git+https://github.com/d4140n-4h3-1/Fyrox.git?branch=vulkan#6a44772d1fe152ee4e5f5a864837afe3853c8e7e"
 dependencies = [
  "bytemuck",
  "fyrox-core",
@@ -1646,7 +1646,7 @@ dependencies = [
 [[package]]
 name = "fyrox-graphics-wgpu"
 version = "2.0.0-rc.1"
-source = "git+https://github.com/d4140n-4h3-1/MazeGame.git?branch=main#e2ddfb8a24b82bc01d23e80cd80aba7c6cf5ffe7"
+source = "git+https://github.com/d4140n-4h3-1/Fyrox.git?branch=vulkan#6a44772d1fe152ee4e5f5a864837afe3853c8e7e"
 dependencies = [
  "bytemuck",
  "fyrox-core",
@@ -1730,7 +1730,7 @@ dependencies = [
 [[package]]
 name = "fyrox-math"
 version = "2.0.0-rc.1"
-source = "git+https://github.com/d4140n-4h3-1/Fyrox.git?branch=vulkan#9955c270f81789401b5d3e1193f6be730a366054"
+source = "git+https://github.com/d4140n-4h3-1/Fyrox.git?branch=vulkan#6a44772d1fe152ee4e5f5a864837afe3853c8e7e"
 dependencies = [
  "arrayvec",
  "bytemuck",
@@ -5716,7 +5716,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
