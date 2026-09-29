@@ -126,6 +126,10 @@ pub struct GlassMaterial {
     pub normal_map: Option<TextureResource>,
     /// Texture coordinate scale for the normal map.
     pub tex_coord_scale: Vector2<f32>,
+    /// Whether light shone through it takes on its colour, where shadows are traced: as much of
+    /// it as [`Self::tint_strength`] says. Otherwise light goes through it as if it were not
+    /// there.
+    pub tints_light: bool,
 }
 
 impl Default for GlassMaterial {
@@ -145,6 +149,7 @@ impl Default for GlassMaterial {
             emission_strength: 0.0,
             normal_map: None,
             tex_coord_scale: Vector2::new(1.0, 1.0),
+            tints_light: true,
         }
     }
 }
@@ -188,6 +193,7 @@ impl GlassMaterial {
         material.set_property("emission", self.emission);
         material.set_property("emissionStrength", self.emission_strength);
         material.set_property("texCoordScale", self.tex_coord_scale);
+        material.set_property("tintsLight", if self.tints_light { 1.0f32 } else { 0.0 });
         material
     }
 

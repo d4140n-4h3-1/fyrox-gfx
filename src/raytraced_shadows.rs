@@ -28,17 +28,25 @@
 //! them, and refitted. Hidden meshes still cast shadows while they stand still, since a game hides
 //! what the camera cannot see; once a mesh has moved, or if it is skinned, it casts none while
 //! hidden, as with shadow maps.
+//!
+//! Glass stands in light's way too, but lets it through, taking on its colour: a lamp shone
+//! through red glass casts red light past it. How much of each colour gets through is the glass's
+//! tint, as strongly as its tint strength; glass told not to colour light
+//! ([`crate::GlassMaterial::tints_light`]) is left out, and light goes through it as if it were not
+//! there. The light is only coloured, not bent: where the glass would focus it, it does not.
 
 use fyrox::{
     core::{
         algebra::{Matrix4, Point3, Vector3},
+        color::Color,
         log::Log,
         pool::Handle,
+        sstorage::ImmutableString,
     },
     fxhash::{FxHashMap, FxHashSet},
     graph::SceneGraph,
     graphics::{error::FrameworkError, gpu_texture::GpuTexture, server::GraphicsServer},
-    material::MaterialResource,
+    material::{MaterialProperty, MaterialResource, MaterialResourceBinding},
     renderer::{
         bundle::LightSourceKind,
         traced_shadows::{LightShadowTraceContext, LightShadowTracer},
@@ -112,23 +120,54 @@ pub fn is_supported(server: &dyn GraphicsServer) -> bool {
         .is_some_and(|server| server.ray_tracing)
 }
 
-/// Whether a material draws into shadow maps. Materials that opt out - glass, which light passes
-/// through - are left out of the traced geometry as well, or the glass housings in a ceiling would
-/// shut in the light of the lamps mounted beneath them.
-fn casts_shadows(material: &MaterialResource) -> bool {
+/// How a surface of `material` stands in the way of light: solid, glass that lets through so
+/// much of a light's red, green and blue, or not at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Blocks {
+    Solid,
+    Glass([f32; 3]),
+}
+
+/// How a surface of `material` stands in the way of light, if it does. Glass lets light through,
+/// taking on its tint as much as its tint strength says, unless it is told not to colour light,
+/// when it is left out as if it were not there. Any other material that draws into no shadow
+/// maps is left out too.
+fn blocks(material: &MaterialResource) -> Option<Blocks> {
     let material = material.state();
     let Some(material) = material.data_ref() else {
-        return true;
+        return Some(Blocks::Solid);
     };
+    if material.shader() == &crate::refraction::glass_shader() {
+        let key = ImmutableString::new("properties");
+        let Some(MaterialResourceBinding::PropertyGroup(group)) = material.bindings().get(&key)
+        else {
+            return None;
+        };
+        let float = |name: &str, default: f32| match group.property_ref(name) {
+            Some(MaterialProperty::Float(v)) => *v,
+            _ => default,
+        };
+        if float("tintsLight", 1.0) <= 0.0 {
+            return None;
+        }
+        let strength = float("tintStrength", 0.0).clamp(0.0, 1.0);
+        let tint = match group.property_ref("tint") {
+            Some(MaterialProperty::Color(tint)) => *tint,
+            _ => Color::WHITE,
+        };
+        let through = |c: u8| 1.0 - strength * (1.0 - c as f32 / 255.0);
+        return Some(Blocks::Glass([through(tint.r), through(tint.g), through(tint.b)]));
+    }
     let shader = material.shader().state();
     let Some(shader) = shader.data_ref() else {
-        return true;
+        return Some(Blocks::Solid);
     };
-    !shader
+    let opted_out = shader
         .definition
         .disabled_passes
         .iter()
-        .any(|pass| pass == "PointShadow")
+        .any(|pass| pass == "PointShadow");
+    (!opted_out).then_some(Blocks::Solid)
 }
 
 /// How far a mesh may drift, in meters, before it counts as having moved.
@@ -207,7 +246,8 @@ fn triangles(surface: &Surface, count: usize) -> Vec<u32> {
 /// data, or, skinned, its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Shape {
-    Shared(u64),
+    /// With whether it is glass: the same data could be drawn solid and as glass.
+    Shared(u64, bool),
     Posed(Handle<Node>, usize),
 }
 
@@ -283,7 +323,7 @@ impl LightShadowTracer for TracedLightShadows {
 
         // What each surface that casts shadows is traced with, where, and which surface it is; and
         // posed vertices.
-        let mut placed: Vec<(Shape, [f32; 12], Handle<Node>, usize)> = Vec::new();
+        let mut placed: Vec<(Shape, [f32; 12], Handle<Node>, usize, Blocks)> = Vec::new();
         let mut posed: Vec<(Shape, Vec<f32>)> = Vec::new();
         let mut places = FxHashMap::default();
         for (handle, node) in graph.pair_iter() {
@@ -307,16 +347,18 @@ impl LightShadowTracer for TracedLightShadows {
                 continue;
             }
             for (n, surface) in mesh.surfaces().iter().enumerate() {
-                if !casts_shadows(surface.material()) {
+                let Some(how) = blocks(surface.material()) else {
                     continue;
-                }
+                };
                 if surface.bones().is_empty() {
-                    let shape = Shape::Shared(surface.data().key());
-                    placed.push((shape, instance_transform(&transform), handle, n));
+                    let glass = matches!(how, Blocks::Glass(_));
+                    let shape = Shape::Shared(surface.data().key(), glass);
+                    placed.push((shape, instance_transform(&transform), handle, n, how));
                 } else {
                     let shape = Shape::Posed(handle, n);
                     posed.push((shape, positions(graph, surface)));
-                    placed.push((shape, instance_transform(&Matrix4::identity()), handle, n));
+                    let at = instance_transform(&Matrix4::identity());
+                    placed.push((shape, at, handle, n, how));
                 }
             }
         }
@@ -327,7 +369,7 @@ impl LightShadowTracer for TracedLightShadows {
         // number.
         let posed_vertices = |shape: &Shape| posed.iter().find(|(s, _)| s == shape).map(|(_, v)| v);
         let mut built = 0;
-        for &(shape, _, handle, n) in &placed {
+        for &(shape, _, handle, n, how) in &placed {
             let fresh = match self.geometry.get(&shape) {
                 None => true,
                 Some(had) => posed_vertices(&shape)
@@ -350,7 +392,11 @@ impl LightShadowTracer for TracedLightShadows {
             };
             let indices = triangles(surface, vertices.len() / 3);
             let updatable = matches!(shape, Shape::Posed(..));
-            if let Some(geometry) = server.build_ray_traced_geometry(&vertices, &indices, updatable)? {
+            let geometry = match how {
+                Blocks::Solid => server.build_ray_traced_geometry(&vertices, &indices, updatable)?,
+                Blocks::Glass(_) => server.build_ray_traced_glass(&vertices, &indices, updatable)?,
+            };
+            if let Some(geometry) = geometry {
                 self.geometry.insert(shape, geometry);
                 built += 1;
             }
@@ -372,10 +418,17 @@ impl LightShadowTracer for TracedLightShadows {
 
         let instances: Vec<RayTracedInstance> = placed
             .iter()
-            .filter_map(|(shape, transform, ..)| {
+            .filter_map(|(shape, transform, _, _, how)| {
+                let geometry = self.geometry.get(shape)?;
+                // Posed geometry built solid stays so even if its surface turns to glass.
+                let lets_through = match how {
+                    Blocks::Glass(through) if geometry.is_see_through() => *through,
+                    _ => [0.0; 3],
+                };
                 Some(RayTracedInstance {
-                    geometry: self.geometry.get(shape)?,
+                    geometry,
                     transform: *transform,
+                    lets_through,
                 })
             })
             .collect();

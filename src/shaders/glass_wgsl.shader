@@ -73,6 +73,12 @@
                     name: "texCoordScale",
                     kind: Vector2(value: (1.0, 1.0)),
                 ),
+                // Whether light shone through it takes on its colour, in traced shadows: read by
+                // the shadows, not by this shader.
+                (
+                    name: "tintsLight",
+                    kind: Float(value: 1.0),
+                ),
             ]),
             binding: 0
         ),
