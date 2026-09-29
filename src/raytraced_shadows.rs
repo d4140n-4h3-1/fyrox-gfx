@@ -62,6 +62,7 @@ use fyrox::{
         Scene,
     },
 };
+use std::{cell::RefCell, rc::Rc};
 use fyrox_graphics_wgpu::{
     raytracing::{
         RayTracedGeometry, RayTracedInstance, RayTracedScene, ShadowRayLight,
@@ -118,6 +119,12 @@ pub fn is_supported(server: &dyn GraphicsServer) -> bool {
         .as_any()
         .downcast_ref::<WgpuGraphicsServer>()
         .is_some_and(|server| server.ray_tracing)
+}
+
+/// Whether the graphics server is the engine's wgpu one, which the area lights need, tracing or
+/// not.
+pub(crate) fn is_supported_backend(server: &dyn GraphicsServer) -> bool {
+    server.as_any().is::<WgpuGraphicsServer>()
 }
 
 /// How a surface of `material` stands in the way of light: solid, glass that lets through so
@@ -251,11 +258,15 @@ enum Shape {
     Posed(Handle<Node>, usize),
 }
 
+/// The scene as traced, shared with the area lights ([`crate::area_lights`]), which trace
+/// against it too.
+pub(crate) type SharedScene = Rc<RefCell<Option<RayTracedScene>>>;
+
 /// Makes the renderer's shadows by tracing rays. [`crate::GraphicsEffects`] installs it.
 pub struct TracedLightShadows {
     settings: RayTracedShadows,
     tracer: Option<ShadowTracer>,
-    scene: Option<RayTracedScene>,
+    scene: SharedScene,
     /// Which scene it traces.
     scene_handle: Option<Handle<Scene>>,
     /// Each shape's geometry, built once, and posed geometry refitted every frame.
@@ -270,18 +281,18 @@ impl std::fmt::Debug for TracedLightShadows {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TracedLightShadows")
             .field("settings", &self.settings)
-            .field("built", &self.scene.is_some())
+            .field("built", &self.scene.borrow().is_some())
             .field("geometry", &self.geometry.len())
             .finish()
     }
 }
 
 impl TracedLightShadows {
-    pub fn new(settings: RayTracedShadows) -> Self {
+    pub(crate) fn new(settings: RayTracedShadows, scene: SharedScene) -> Self {
         Self {
             settings,
             tracer: None,
-            scene: None,
+            scene,
             scene_handle: None,
             geometry: Default::default(),
             places: Default::default(),
@@ -313,7 +324,7 @@ impl LightShadowTracer for TracedLightShadows {
         }
 
         if self.scene_handle != Some(scene_handle) {
-            self.scene = None;
+            *self.scene.borrow_mut() = None;
             self.geometry.clear();
             self.places.clear();
             self.moved.clear();
@@ -432,12 +443,13 @@ impl LightShadowTracer for TracedLightShadows {
                 })
             })
             .collect();
-        match self.scene.as_mut() {
+        let mut shared = self.scene.borrow_mut();
+        match shared.as_mut() {
             Some(traced) => server.update_ray_traced_instances(traced, &instances)?,
-            None => self.scene = server.build_ray_traced_instances(&instances)?,
+            None => *shared = server.build_ray_traced_instances(&instances)?,
         }
         if built > 0 {
-            if let Some(traced) = self.scene.as_ref() {
+            if let Some(traced) = shared.as_ref() {
                 Log::info(format!(
                     "Ray traced shadows: {} pieces of geometry, {} copies, {} triangles",
                     self.geometry.len(),
@@ -460,7 +472,8 @@ impl LightShadowTracer for TracedLightShadows {
         let Some(server) = ctx.server.as_any().downcast_ref::<WgpuGraphicsServer>() else {
             return Ok(None);
         };
-        let (Some(scene), Some(tracer)) = (self.scene.as_ref(), self.tracer.as_mut()) else {
+        let shared = self.scene.borrow();
+        let (Some(scene), Some(tracer)) = (shared.as_ref(), self.tracer.as_mut()) else {
             return Ok(None);
         };
 

@@ -11,6 +11,8 @@
 //! - [`occlusion`]: how far ambient occlusion reaches, which is what keeps corners from going
 //!   flat. On by default, at the engine's own strength.
 //! - [`reflections`]: ray-marched against the depth buffer. Off by default.
+//! - [`area_lights`] (feature `raytracing`): glowing rectangles that light what is round them,
+//!   with soft traced shadows where shadows are traced. Off until the game sets some.
 //! - [`moving`]: what in the scene moves, which the game tells the effects every frame so that
 //!   temporal anti-aliasing does not leave a ghost behind it.
 //! - [`shadows::ShadowBudget`]: keeps shadow maps for the lights nearest the camera only, which is
@@ -38,6 +40,8 @@
 //! that is on for games that want reflections everywhere.
 
 pub mod antialiasing;
+#[cfg(feature = "raytracing")]
+pub mod area_lights;
 pub mod moving;
 pub mod occlusion;
 #[cfg(feature = "raytracing")]
@@ -49,6 +53,8 @@ pub mod shadows;
 pub mod temporal;
 
 pub use antialiasing::AntiAliasing;
+#[cfg(feature = "raytracing")]
+pub use area_lights::{AreaLight, AreaLights};
 pub use moving::{MovingThing, MovingThings};
 pub use occlusion::AmbientOcclusion;
 #[cfg(feature = "raytracing")]
@@ -108,6 +114,15 @@ pub struct GraphicsEffects {
     #[visit(skip)]
     #[reflect(hidden)]
     ray_traced_shadows: Option<RayTracedShadows>,
+    /// The glowing rectangles, as the game says.
+    #[cfg(feature = "raytracing")]
+    #[visit(skip)]
+    #[reflect(hidden)]
+    area_lights: AreaLights,
+    #[cfg(feature = "raytracing")]
+    #[visit(skip)]
+    #[reflect(hidden)]
+    area_light_pass: Option<Rc<RefCell<area_lights::AreaLightPass>>>,
     /// Whether the renderer's shadows are being traced, which leaves the shadow budget with
     /// nothing to do.
     #[visit(skip)]
@@ -133,6 +148,10 @@ impl Default for GraphicsEffects {
             temporal_frame: 0,
             #[cfg(feature = "raytracing")]
             ray_traced_shadows: None,
+            #[cfg(feature = "raytracing")]
+            area_lights: AreaLights::default(),
+            #[cfg(feature = "raytracing")]
+            area_light_pass: None,
             shadows_traced: false,
         }
     }
@@ -144,6 +163,13 @@ impl GraphicsEffects {
     /// executor stays connected.
     pub fn moving_things(&self) -> MovingThings {
         self.moving.clone()
+    }
+
+    /// The list of area lights, for the game to fill - see [`area_lights`]. Shared like
+    /// [`Self::moving_things`].
+    #[cfg(feature = "raytracing")]
+    pub fn area_lights(&self) -> AreaLights {
+        self.area_lights.clone()
     }
 
     /// Leaves shadow settings as the game set them.
@@ -234,6 +260,20 @@ impl PartialEq for GraphicsEffects {
 impl Plugin for GraphicsEffects {
     fn on_graphics_context_initialized(&mut self, ctx: PluginContext) -> GameResult {
         if let GraphicsContext::Initialized(graphics_context) = ctx.graphics_context {
+            // The scene as traced for shadows, which the area lights trace against too.
+            #[cfg(feature = "raytracing")]
+            let traced_scene = raytraced_shadows::SharedScene::default();
+            // Before the glass, so glass shows the light behind it.
+            #[cfg(feature = "raytracing")]
+            if raytraced_shadows::is_supported_backend(graphics_context.renderer.graphics_server()) {
+                let pass = Rc::new(RefCell::new(area_lights::AreaLightPass::new(
+                    TypeId::of::<Self>(),
+                    self.area_lights.clone(),
+                    traced_scene.clone(),
+                )));
+                graphics_context.renderer.add_render_pass(pass.clone());
+                self.area_light_pass = Some(pass);
+            }
             let pass = Rc::new(RefCell::new(RefractionPass::new(TypeId::of::<Self>())));
             graphics_context.renderer.add_render_pass(pass.clone());
             self.refraction = Some(pass);
@@ -259,7 +299,7 @@ impl Plugin for GraphicsEffects {
                 self.shadows_traced = raytraced_shadows::is_supported(renderer.graphics_server());
                 if self.shadows_traced {
                     renderer.set_light_shadow_tracer(Some(Box::new(
-                        raytraced_shadows::TracedLightShadows::new(shadows),
+                        raytraced_shadows::TracedLightShadows::new(shadows, traced_scene),
                     )));
                 }
             }
