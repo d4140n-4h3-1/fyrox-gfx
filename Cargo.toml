@@ -27,3 +27,8 @@ fyrox-graphics-wgpu = { git = "https://github.com/d4140n-4h3-1/Fyrox.git", branc
 [[example]]
 name = "glass"
 required-features = []
+
+# The engine fork's wgpu backend as MazeGame carries it, with the moving geometry the traced
+# shadows use, until the fork has it. A game building this crate patches it the same way.
+[patch."https://github.com/d4140n-4h3-1/Fyrox.git"]
+fyrox-graphics-wgpu = { git = "https://github.com/d4140n-4h3-1/MazeGame.git", branch = "main" }
