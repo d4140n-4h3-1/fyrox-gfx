@@ -25,7 +25,9 @@
 //! once for every mesh made from the same surface data, such as a maze's repeated tiles - and every
 //! frame a copy of each is placed wherever its mesh is, so what moves casts its shadow from where
 //! it is. A skinned mesh's triangles are skinned by its bones every frame, as the renderer draws
-//! them, and refitted. Hidden meshes still cast shadows while they stand still, since a game hides
+//! them, and refitted - within [`SKIN_REACH`] of the camera; further off, its shadow stays as it
+//! last was, too small to tell. Each skinned surface's vertices, and the bones and weights they
+//! hang off, are read once and kept, so that posing them is only the arithmetic. Hidden meshes still cast shadows while they stand still, since a game hides
 //! what the camera cannot see; once a mesh has moved, or if it is skinned, it casts none while
 //! hidden, as with shadow maps.
 //!
@@ -52,6 +54,7 @@ use fyrox::{
         traced_shadows::{LightShadowTraceContext, LightShadowTracer},
     },
     scene::{
+        camera::Camera,
         graph::Graph,
         mesh::{
             surface::Surface,
@@ -196,6 +199,68 @@ fn instance_transform(transform: &Matrix4<f32>) -> [f32; 12] {
     out
 }
 
+/// How far from the camera a skinned mesh is posed afresh every frame, in meters: further off,
+/// its shadow is too small for its pose to tell.
+pub const SKIN_REACH: f32 = 30.0;
+
+/// A skinned surface's vertices as its data has them, read once: where each is in its own space,
+/// and the four bones each hangs off, with how much.
+struct Skin {
+    positions: Vec<Vector3<f32>>,
+    bones: Vec<[u8; 4]>,
+    weights: Vec<[f32; 4]>,
+}
+
+impl Skin {
+    fn read(surface: &Surface) -> Self {
+        let data = surface.data();
+        let data = data.data_ref();
+        let count = data.vertex_buffer.vertex_count() as usize;
+        let (mut positions, mut bones, mut weights) =
+            (Vec::with_capacity(count), Vec::with_capacity(count), Vec::with_capacity(count));
+        for vertex in data.vertex_buffer.iter() {
+            let (Ok(position), Ok(which), Ok(weight)) = (
+                vertex.read_3_f32(VertexAttributeUsage::Position),
+                vertex.read_4_u8(VertexAttributeUsage::BoneIndices),
+                vertex.read_4_f32(VertexAttributeUsage::BoneWeight),
+            ) else {
+                break;
+            };
+            positions.push(position);
+            bones.push(which.into());
+            weights.push(weight.into());
+        }
+        Self { positions, bones, weights }
+    }
+
+    /// Where `surface`'s bones in `graph` put its vertices in the world, three floats each.
+    fn pose(&self, graph: &Graph, surface: &Surface) -> Vec<f32> {
+        let matrices: Vec<Matrix4<f32>> = surface
+            .bones()
+            .iter()
+            .map(|&bone| {
+                graph.try_get_node(bone).map_or(Matrix4::identity(), |bone| {
+                    bone.global_transform() * bone.inv_bind_pose_transform()
+                })
+            })
+            .collect();
+        let mut out = Vec::with_capacity(self.positions.len() * 3);
+        for ((position, which), weights) in self.positions.iter().zip(&self.bones).zip(&self.weights) {
+            let point = Point3::from(*position);
+            let mut world = Vector3::zeros();
+            for (&bone, &weight) in which.iter().zip(weights) {
+                if weight > 0.0 {
+                    if let Some(matrix) = matrices.get(bone as usize) {
+                        world += matrix.transform_point(&point).coords * weight;
+                    }
+                }
+            }
+            out.extend_from_slice(&[world.x, world.y, world.z]);
+        }
+        out
+    }
+}
+
 /// `surface`'s vertex positions, three floats each: in its own space, or, skinned, where its
 /// bones in `graph` put them in the world, as the renderer draws it.
 fn positions(graph: &Graph, surface: &Surface) -> Vec<f32> {
@@ -274,6 +339,8 @@ pub struct TracedLightShadows {
     /// Where each mesh was last frame, to tell when one moves; and the meshes that have.
     places: FxHashMap<Handle<Node>, Matrix4<f32>>,
     moved: FxHashSet<Handle<Node>>,
+    /// Each skinned surface's vertices, read once, by its data.
+    skins: FxHashMap<u64, Skin>,
     unsupported_reported: bool,
 }
 
@@ -297,6 +364,7 @@ impl TracedLightShadows {
             geometry: Default::default(),
             places: Default::default(),
             moved: Default::default(),
+            skins: Default::default(),
             unsupported_reported: false,
         }
     }
@@ -328,14 +396,21 @@ impl LightShadowTracer for TracedLightShadows {
             self.geometry.clear();
             self.places.clear();
             self.moved.clear();
+            self.skins.clear();
             self.scene_handle = Some(scene_handle);
         }
         let graph = &scene.graph;
+        // Where the camera is, to pose only the skinned meshes near enough to tell.
+        let camera = graph.linear_iter().find_map(|node| {
+            node.cast::<Camera>()
+                .filter(|camera| camera.is_enabled())
+                .map(|camera| camera.global_position())
+        });
 
         // What each surface that casts shadows is traced with, where, and which surface it is; and
         // posed vertices.
         let mut placed: Vec<(Shape, [f32; 12], Handle<Node>, usize, Blocks)> = Vec::new();
-        let mut posed: Vec<(Shape, Vec<f32>)> = Vec::new();
+        let mut posed: FxHashMap<Shape, Vec<f32>> = FxHashMap::default();
         let mut places = FxHashMap::default();
         for (handle, node) in graph.pair_iter() {
             let Some(mesh) = node.cast::<Mesh>() else {
@@ -367,7 +442,12 @@ impl LightShadowTracer for TracedLightShadows {
                     placed.push((shape, instance_transform(&transform), handle, n, how));
                 } else {
                     let shape = Shape::Posed(handle, n);
-                    posed.push((shape, positions(graph, surface)));
+                    // Posed afresh near the camera, or for the first time; further off, as it was.
+                    let near = camera.is_none_or(|camera| (node.global_position() - camera).norm() < SKIN_REACH);
+                    if near || !self.geometry.contains_key(&shape) {
+                        let skin = self.skins.entry(surface.data().key()).or_insert_with(|| Skin::read(surface));
+                        posed.insert(shape, skin.pose(graph, surface));
+                    }
                     let at = instance_transform(&Matrix4::identity());
                     placed.push((shape, at, handle, n, how));
                 }
@@ -378,7 +458,7 @@ impl LightShadowTracer for TracedLightShadows {
 
         // Geometry for shapes seen for the first time, and posed ones whose vertices changed in
         // number.
-        let posed_vertices = |shape: &Shape| posed.iter().find(|(s, _)| s == shape).map(|(_, v)| v);
+        let posed_vertices = |shape: &Shape| posed.get(shape);
         let mut built = 0;
         for &(shape, _, handle, n, how) in &placed {
             let fresh = match self.geometry.get(&shape) {
@@ -413,8 +493,8 @@ impl LightShadowTracer for TracedLightShadows {
             }
         }
         // Only what is still there.
-        self.geometry
-            .retain(|shape, _| placed.iter().any(|(s, ..)| s == shape));
+        let there: FxHashSet<Shape> = placed.iter().map(|(shape, ..)| *shape).collect();
+        self.geometry.retain(|shape, _| there.contains(shape));
 
         // Posed geometry, refitted where it is this frame.
         let updates: Vec<(&RayTracedGeometry, &[f32])> = posed
