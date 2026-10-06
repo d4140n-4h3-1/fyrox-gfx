@@ -19,6 +19,18 @@
             binding: 2
         ),
         (
+            // How metallic each surface is, in red, and how rough, in green.
+            name: "sceneMaterial",
+            kind: Texture(kind: Sampler2D, fallback: Black),
+            binding: 3
+        ),
+        (
+            // The colour of each surface, which a metal tints what it reflects with.
+            name: "sceneDiffuse",
+            kind: Texture(kind: Sampler2D, fallback: White),
+            binding: 4
+        ),
+        (
             name: "properties",
             kind: PropertyGroup([
                 (name: "worldViewProjection", kind: Matrix4()),
@@ -36,6 +48,12 @@
                 (name: "strength", kind: Float(value: 0.35)),
                 // Only surfaces facing at least this far upwards reflect; 1 is straight up.
                 (name: "minUpwards", kind: Float(value: 0.7)),
+                // How much a polished metal reflects, from 0 to 1.
+                (name: "metalStrength", kind: Float(value: 0.8)),
+                // How rough a surface can be and still reflect at all, from 0 to 1.
+                (name: "maxRoughness", kind: Float(value: 0.9)),
+                // Counts the frames, for the noise that spreads the rays to change every frame.
+                (name: "frame", kind: Float(value: 0.0)),
             ]),
             binding: 0
         ),
@@ -109,6 +127,24 @@
                         return S_UnProject(vec3(uv, depth), properties.inverseViewProjection);
                     }
 
+                    bool onScreen(vec3 screen) {
+                        return screen.x >= 0.0 && screen.x <= 1.0 && screen.y >= 0.0 && screen.y <= 1.0 && screen.z <= 1.0;
+                    }
+
+                    // Noise from 0 to 1 that changes from pixel to pixel with no pattern the eye
+                    // picks out, and from frame to frame, for temporal anti-aliasing to average.
+                    float noise(vec2 pixel, float frame) {
+                        vec2 p = pixel + 5.588238 * frame;
+                        return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+                    }
+
+                    // Whether the ray, `travelled` along from `start`, has gone behind what is on
+                    // screen there.
+                    bool behind(vec3 start, vec3 ray, float travelled) {
+                        vec3 screen = toScreen(start + ray * travelled);
+                        return texture(sceneDepth, screen.xy).r < screen.z;
+                    }
+
                     void main()
                     {
                         vec2 uv = gl_FragCoord.xy / properties.screenSize;
@@ -127,10 +163,28 @@
                             FragColor = vec4(0.0);
                             return;
                         }
+                        vec4 material = texture(sceneMaterial, uv);
+                        float metallic = clamp(material.x, 0.0, 1.0);
+                        float roughness = clamp(material.y, 0.0, 1.0);
+                        if (roughness >= properties.maxRoughness) {
+                            FragColor = vec4(0.0);
+                            return;
+                        }
 
                         vec3 position = worldAt(uv, depth);
                         vec3 toCamera = normalize(properties.cameraPosition - position);
-                        vec3 ray = reflect(-toCamera, normal);
+                        vec3 mirror = reflect(-toCamera, normal);
+                        // A rough surface scatters what it reflects: each pixel sends its ray off a
+                        // little to the side of the mirror's, further the rougher it is, a
+                        // different way every frame, and anti-aliasing averages them into a blur.
+                        float spin = 6.2831853 * noise(gl_FragCoord.xy, properties.frame);
+                        float spread = roughness * roughness * sqrt(noise(gl_FragCoord.yx + 17.0, properties.frame));
+                        vec3 side = normalize(cross(mirror, abs(mirror.y) > 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0)));
+                        vec3 up = cross(side, mirror);
+                        vec3 ray = normalize(mirror + spread * (cos(spin) * side + sin(spin) * up));
+                        if (dot(ray, normal) <= 0.0) {
+                            ray = mirror;
+                        }
                         if (dot(ray, normal) <= 0.0) {
                             FragColor = vec4(0.0);
                             return;
@@ -138,46 +192,72 @@
 
                         int stepCount = max(properties.steps, 1);
                         float stepLength = properties.reach / float(stepCount);
-                        // Start a step out, so a surface never reflects itself.
-                        float travelled = stepLength;
+                        // Each pixel starts at its own point within the first step: steps of the
+                        // same length everywhere would show the steps as bands across the floor.
+                        // Never at the surface itself, which would only reflect itself.
+                        float travelled = stepLength * (0.25 + noise(gl_FragCoord.xy + 31.0, properties.frame));
+                        float before = 0.0;
                         vec2 hitUv = vec2(0.0);
-                        bool hit = false;
+                        float confidence = 0.0;
 
                         for (int i = 0; i < stepCount; ++i) {
-                            vec3 samplePoint = position + ray * travelled;
-                            vec3 screen = toScreen(samplePoint);
-                            if (screen.x < 0.0 || screen.x > 1.0 || screen.y < 0.0 || screen.y > 1.0 || screen.z > 1.0) {
+                            vec3 screen = toScreen(position + ray * travelled);
+                            if (!onScreen(screen)) {
                                 break;
                             }
-                            float sceneDepthValue = texture(sceneDepth, screen.xy).r;
-                            if (sceneDepthValue < screen.z) {
-                                // The ray has gone behind something. If it is only just behind,
-                                // that something is what it hit; if it is far behind, the ray
-                                // passed behind a foreground object and there is nothing to show.
-                                vec3 scenePosition = worldAt(screen.xy, sceneDepthValue);
-                                if (distance(scenePosition, samplePoint) < properties.thickness) {
-                                    hitUv = screen.xy;
-                                    hit = true;
+                            if (behind(position, ray, travelled)) {
+                                // Somewhere between the last step and this one the ray went behind
+                                // something: halve the gap to find where, as near as can be.
+                                float near = before;
+                                float far = travelled;
+                                for (int j = 0; j < 6; ++j) {
+                                    float middle = 0.5 * (near + far);
+                                    if (behind(position, ray, middle)) {
+                                        far = middle;
+                                    } else {
+                                        near = middle;
+                                    }
                                 }
-                                break;
+                                vec3 hitPoint = position + ray * far;
+                                vec3 found = toScreen(hitPoint);
+                                float sceneDepthValue = texture(sceneDepth, found.xy).r;
+                                float gap = distance(worldAt(found.xy, sceneDepthValue), hitPoint);
+                                // Only just behind it, it hit it: unless that is its back, which
+                                // nothing reflected can be. Far behind, the ray passed behind
+                                // something nearer the camera, and goes on to look past it.
+                                vec3 facing = normalize(texture(sceneNormal, found.xy).xyz * 2.0 - 1.0);
+                                float sure = 1.0 - smoothstep(0.5 * properties.thickness, properties.thickness, gap);
+                                if (sure > 0.0 && dot(facing, ray) < 0.1) {
+                                    hitUv = found.xy;
+                                    travelled = far;
+                                    confidence = sure;
+                                    break;
+                                }
                             }
+                            before = travelled;
                             travelled += stepLength;
                         }
 
-                        if (!hit) {
+                        if (confidence <= 0.0) {
                             FragColor = vec4(0.0);
                             return;
                         }
 
-                        // Fade out where the reflection runs off the screen, and where it is seen
-                        // head on - a floor reflects most at a grazing angle.
+                        // Fade out where the reflection runs off the screen, and as far as the
+                        // ray reaches.
                         float edge = min(min(hitUv.x, 1.0 - hitUv.x), min(hitUv.y, 1.0 - hitUv.y));
                         float edgeFade = smoothstep(0.0, 0.15, edge);
+                        float distanceFade = 1.0 - smoothstep(0.6, 1.0, travelled / properties.reach);
+                        // A surface reflects more seen at a grazing angle than head on - a metal
+                        // a lot at any angle - and less the rougher it is.
                         float grazing = pow(1.0 - clamp(dot(toCamera, normal), 0.0, 1.0), 2.0);
-                        float distanceFade = 1.0 - clamp(travelled / properties.reach, 0.0, 1.0);
+                        float shine = mix(properties.strength * mix(0.25, 1.0, grazing), properties.metalStrength, metallic);
+                        float gloss = 1.0 - smoothstep(0.35, properties.maxRoughness, roughness);
 
-                        float amount = properties.strength * edgeFade * distanceFade * mix(0.25, 1.0, grazing);
-                        vec3 color = texture(sceneColor, hitUv).rgb;
+                        float amount = shine * gloss * edgeFade * distanceFade * confidence;
+                        // A metal colours what it reflects with its own colour.
+                        vec3 tint = mix(vec3(1.0), texture(sceneDiffuse, uv).rgb, metallic);
+                        vec3 color = texture(sceneColor, hitUv).rgb * tint;
                         FragColor = vec4(color, amount);
                     }
                 "#,

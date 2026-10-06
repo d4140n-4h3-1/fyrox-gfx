@@ -13,6 +13,18 @@
 //!
 //! Only surfaces facing upwards reflect by default ([`Reflections::min_upwards`]): a floor's
 //! reflection is mostly on screen, a wall's mostly is not.
+//!
+//! The ray is followed in steps, each pixel starting at its own point within the first so the
+//! steps do not show as bands, and where it goes behind something the gap is halved until it is
+//! found where it went behind - a sharp, unbroken reflection, even of thin things. A ray that only
+//! passed behind something nearer the camera goes on past it; one that hits the back of something
+//! finds nothing, since nothing reflected can be its back.
+//!
+//! How much a surface reflects, and how sharply, is its material's: smooth surfaces reflect like
+//! mirrors, rougher ones blur what they reflect - each pixel's ray goes off a little to the side
+//! of the mirror's, a different way every frame, which temporal anti-aliasing averages - and fade
+//! out altogether towards [`Reflections::max_roughness`]. Metals reflect more
+//! ([`Reflections::metal_strength`]), and colour what they reflect with their own colour.
 
 use crate::scene_copy::SceneCopy;
 use fyrox::{
@@ -50,6 +62,12 @@ pub struct Reflections {
     pub strength: f32,
     /// How far a surface must face upwards to reflect at all: 1 is straight up, 0 is anything.
     pub min_upwards: f32,
+    /// How much of the reflection a polished metal shows, from 0 to 1, in place of
+    /// [`Self::strength`].
+    pub metal_strength: f32,
+    /// How rough a surface can be and still reflect, from 0 to 1: reflections fade out between
+    /// halfway there and this.
+    pub max_roughness: f32,
 }
 
 impl Default for Reflections {
@@ -60,6 +78,8 @@ impl Default for Reflections {
             thickness: 0.4,
             strength: 0.35,
             min_upwards: 0.7,
+            metal_strength: 0.8,
+            max_roughness: 0.9,
         }
     }
 }
@@ -71,6 +91,8 @@ pub struct ReflectionPass {
     pass_name: ImmutableString,
     shader: Option<RenderPassContainer>,
     copy: SceneCopy,
+    /// Frames drawn, for the noise that spreads the rays to change every frame.
+    frame: u32,
 }
 
 impl std::fmt::Debug for ReflectionPass {
@@ -89,6 +111,7 @@ impl ReflectionPass {
             pass_name: ImmutableString::new("Primary"),
             shader: None,
             copy: SceneCopy::new("FyroxGfxReflectionSource"),
+            frame: 0,
         }
     }
 }
@@ -128,6 +151,9 @@ impl SceneRenderPass for ReflectionPass {
             .unwrap_or_else(Matrix4::identity);
         let camera_position = ctx.observer.position.translation;
         let world_view_projection = make_viewport_matrix(ctx.observer.viewport);
+        // The noise repeats after a while, which nobody sees, and stays exact as a float.
+        self.frame = (self.frame + 1) % 1024;
+        let frame = self.frame as f32;
 
         let properties = PropertyGroup::from([
             property("worldViewProjection", &world_view_projection),
@@ -140,6 +166,9 @@ impl SceneRenderPass for ReflectionPass {
             property("thickness", &self.settings.thickness),
             property("strength", &self.settings.strength),
             property("minUpwards", &self.settings.min_upwards),
+            property("metalStrength", &self.settings.metal_strength),
+            property("maxRoughness", &self.settings.max_roughness),
+            property("frame", &frame),
         ]);
         let material = RenderMaterial::from([
             binding(
@@ -157,6 +186,20 @@ impl SceneRenderPass for ReflectionPass {
                 "sceneNormal",
                 (
                     ctx.normal_texture,
+                    &ctx.renderer_resources.nearest_clamp_sampler,
+                ),
+            ),
+            binding(
+                "sceneMaterial",
+                (
+                    ctx.material_texture,
+                    &ctx.renderer_resources.nearest_clamp_sampler,
+                ),
+            ),
+            binding(
+                "sceneDiffuse",
+                (
+                    ctx.diffuse_texture,
                     &ctx.renderer_resources.nearest_clamp_sampler,
                 ),
             ),
@@ -199,7 +242,7 @@ mod tests {
     fn check(source: &str) {
         let shader = Shader::from_string(source).expect("shader parses");
         assert!(shader.definition.passes.iter().any(|p| p.name == "Primary"));
-        for name in ["sceneColor", "sceneDepth", "sceneNormal"] {
+        for name in ["sceneColor", "sceneDepth", "sceneNormal", "sceneMaterial", "sceneDiffuse"] {
             assert!(
                 shader
                     .definition
