@@ -24,11 +24,21 @@
 //! Each mesh's triangles are put into the hardware's structure once, in the mesh's own space -
 //! once for every mesh made from the same surface data, such as a maze's repeated tiles - and every
 //! frame a copy of each is placed wherever its mesh is, so what moves casts its shadow from where
-//! it is. A skinned mesh's triangles are skinned by its bones every frame, as the renderer draws
+//! it is. Most of a scene never moves, though, and placing thousands of copies every frame costs
+//! more than tracing against them: so a mesh that has stood still for a second
+//! ([`SETTLE_FRAMES`]) is put in with the others standing still in the same cube of space
+//! ([`BATCH_CELL`]), as one piece of geometry already where they all are, placed once. A maze of
+//! thousands of walls is traced as a few hundred pieces. When a mesh that was put in moves, or
+//! goes, or one comes to stand still beside them, only its cube is put together again; and when
+//! nothing has moved or changed since the last frame, the scene is not placed again at all.
+//!
+//! A skinned mesh's triangles are skinned by its bones every frame, as the renderer draws
 //! them, and refitted - within [`SKIN_REACH`] of the camera; further off, its shadow stays as it
 //! last was, too small to tell. Each skinned surface's vertices, and the bones and weights they
-//! hang off, are read once and kept, so that posing them is only the arithmetic. Hidden meshes still cast shadows while they stand still, since a game hides
-//! what the camera cannot see; once a mesh has moved, or if it is skinned, it casts none while
+//! hang off, are read once and kept, so that posing them is only the arithmetic; and a surface
+//! whose bones have not moved since it was last posed - a body lying still, say - is not posed
+//! again, nor its geometry refitted: it casts the shadow it last did, at no cost. Hidden meshes
+//! still cast shadows while they stand still, since a game hides what the camera cannot see; once a mesh has moved, or if it is skinned, it casts none while
 //! hidden, as with shadow maps.
 //!
 //! Glass stands in light's way too, but lets it through, taking on its colour: a lamp shone
@@ -183,6 +193,19 @@ fn blocks(material: &MaterialResource) -> Option<Blocks> {
 /// How far a mesh may drift, in meters, before it counts as having moved.
 const MOVED: f32 = 1.0e-4;
 
+/// Adds a copy of `local` vertices and their `triangles` to `vertices` and `indices`, placed by
+/// `at` (see [`instance_transform`]), its indices counting on from the vertices already there.
+fn append_placed(vertices: &mut Vec<f32>, indices: &mut Vec<u32>, local: &[f32], triangles: &[u32], at: &[f32; 12]) {
+    let first = (vertices.len() / 3) as u32;
+    for p in local.chunks_exact(3) {
+        for row in 0..3 {
+            let m = &at[row * 4..row * 4 + 4];
+            vertices.push(m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3]);
+        }
+    }
+    indices.extend(triangles.iter().map(|i| i + first));
+}
+
 /// Whether `a` and `b` put things in the same place.
 fn same_place(a: &Matrix4<f32>, b: &Matrix4<f32>) -> bool {
     a.iter().zip(b.iter()).all(|(a, b)| (a - b).abs() <= MOVED)
@@ -233,17 +256,9 @@ impl Skin {
         Self { positions, bones, weights }
     }
 
-    /// Where `surface`'s bones in `graph` put its vertices in the world, three floats each.
-    fn pose(&self, graph: &Graph, surface: &Surface) -> Vec<f32> {
-        let matrices: Vec<Matrix4<f32>> = surface
-            .bones()
-            .iter()
-            .map(|&bone| {
-                graph.try_get_node(bone).map_or(Matrix4::identity(), |bone| {
-                    bone.global_transform() * bone.inv_bind_pose_transform()
-                })
-            })
-            .collect();
+    /// Where bones posed by `matrices` (see [`bone_matrices`]) put its vertices in the world,
+    /// three floats each.
+    fn pose(&self, matrices: &[Matrix4<f32>]) -> Vec<f32> {
         let mut out = Vec::with_capacity(self.positions.len() * 3);
         for ((position, which), weights) in self.positions.iter().zip(&self.bones).zip(&self.weights) {
             let point = Point3::from(*position);
@@ -314,6 +329,83 @@ fn triangles(surface: &Surface, count: usize) -> Vec<u32> {
         .collect()
 }
 
+/// What each of `surface`'s bones in `graph` does to the vertices hanging off it, in the world.
+fn bone_matrices(graph: &Graph, surface: &Surface) -> Vec<Matrix4<f32>> {
+    surface
+        .bones()
+        .iter()
+        .map(|&bone| {
+            graph.try_get_node(bone).map_or(Matrix4::identity(), |bone| {
+                bone.global_transform() * bone.inv_bind_pose_transform()
+            })
+        })
+        .collect()
+}
+
+/// Whether bones posed by `a` and by `b` put every vertex in the same place: none has moved.
+fn same_pose(a: &[Matrix4<f32>], b: &[Matrix4<f32>]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_place(a, b))
+}
+
+/// How long a mesh has to stand still, in frames, before it is put in with the others standing
+/// still round it ([`Batch`]).
+const SETTLE_FRAMES: u64 = 60;
+
+/// How wide the cubes of space are whose still meshes are traced as one, in meters. Smaller, a
+/// mesh that moves or goes means less to put together again; bigger, fewer pieces to place.
+const BATCH_CELL: f32 = 32.0;
+
+/// Which still meshes are traced together: those in the same cube of space, standing in light's
+/// way the same - solid, or glass letting through the same light.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BatchKey {
+    cell: [i32; 3],
+    /// The light let through, as bits, for glass.
+    glass: Option<[u32; 3]>,
+}
+
+impl BatchKey {
+    fn new(transform: &Matrix4<f32>, how: Blocks) -> Self {
+        let cell = |i: usize| (transform[(i, 3)] / BATCH_CELL).floor() as i32;
+        Self {
+            cell: [cell(0), cell(1), cell(2)],
+            glass: match how {
+                Blocks::Solid => None,
+                Blocks::Glass(through) => Some(through.map(f32::to_bits)),
+            },
+        }
+    }
+
+    fn lets_through(&self) -> [f32; 3] {
+        self.glass.map_or([0.0; 3], |bits| bits.map(f32::from_bits))
+    }
+}
+
+/// Where a mesh was last frame, since which frame it has stood there, and whether it has ever
+/// moved.
+#[derive(Debug, Clone, Copy)]
+struct Place {
+    handle: Handle<Node>,
+    transform: Matrix4<f32>,
+    still_since: u64,
+    moved: bool,
+}
+
+/// A still surface put in with others: which mesh and surface it is, and where.
+type Fixed = (BatchKey, Handle<Node>, usize, [f32; 12]);
+
+/// Still meshes traced as one piece of geometry, already where they are in the world: the
+/// hardware places one copy of it rather than one of each mesh, and nothing about it changes
+/// from frame to frame. A maze's thousands of walls, floors and lamps are a few dozen of these.
+struct Batch {
+    members: Vec<(Handle<Node>, usize, [f32; 12])>,
+    geometry: RayTracedGeometry,
+}
+
+/// A surface that casts shadows: what it is traced with, where, which mesh and surface it is,
+/// and how it stands in the way of light.
+type Placed = (Shape, [f32; 12], Handle<Node>, usize, Blocks);
+
 /// Which geometry a surface is traced with: what it shares with every surface made from the same
 /// data, or, skinned, its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -336,11 +428,25 @@ pub struct TracedLightShadows {
     scene_handle: Option<Handle<Scene>>,
     /// Each shape's geometry, built once, and posed geometry refitted every frame.
     geometry: FxHashMap<Shape, RayTracedGeometry>,
-    /// Where each mesh was last frame, to tell when one moves; and the meshes that have.
-    places: FxHashMap<Handle<Node>, Matrix4<f32>>,
-    moved: FxHashSet<Handle<Node>>,
-    /// Each skinned surface's vertices, read once, by its data.
+    /// Where each mesh was last frame, by the slot its node has in the graph, to tell when one
+    /// moves. Kept from frame to frame, rather than made anew; a slot whose node has gone is taken
+    /// by the next node put there.
+    places: Vec<Option<Place>>,
+    frame: u64,
+    /// What each surface was traced with, where, and which surface it was, last frame - kept to
+    /// fill again, and to tell whether anything has changed since.
+    placed: Vec<Placed>,
+    was_placed: Vec<Placed>,
+    /// The meshes standing still, traced together, by where they are; and last frame's, to tell
+    /// when one has come or gone.
+    batches: FxHashMap<BatchKey, Batch>,
+    fixed: Vec<Fixed>,
+    was_fixed: Vec<Fixed>,
+    /// Each skinned surface's vertices, read once, by its data; and how each posed surface's
+    /// bones stood when it was last posed, so that one whose bones have not moved since is not
+    /// posed again.
     skins: FxHashMap<u64, Skin>,
+    poses: FxHashMap<Shape, Vec<Matrix4<f32>>>,
     unsupported_reported: bool,
 }
 
@@ -363,8 +469,14 @@ impl TracedLightShadows {
             scene_handle: None,
             geometry: Default::default(),
             places: Default::default(),
-            moved: Default::default(),
+            frame: 0,
+            placed: Default::default(),
+            was_placed: Default::default(),
+            batches: Default::default(),
+            fixed: Default::default(),
+            was_fixed: Default::default(),
             skins: Default::default(),
+            poses: Default::default(),
             unsupported_reported: false,
         }
     }
@@ -395,8 +507,11 @@ impl LightShadowTracer for TracedLightShadows {
             *self.scene.borrow_mut() = None;
             self.geometry.clear();
             self.places.clear();
-            self.moved.clear();
+            self.was_placed.clear();
+            self.batches.clear();
+            self.was_fixed.clear();
             self.skins.clear();
+            self.poses.clear();
             self.scene_handle = Some(scene_handle);
         }
         let graph = &scene.graph;
@@ -409,58 +524,140 @@ impl LightShadowTracer for TracedLightShadows {
 
         // What each surface that casts shadows is traced with, where, and which surface it is; and
         // posed vertices.
-        let mut placed: Vec<(Shape, [f32; 12], Handle<Node>, usize, Blocks)> = Vec::new();
+        // Many surfaces share a material, so each material is asked once a frame what it blocks.
+        let mut placed = std::mem::take(&mut self.placed);
+        placed.clear();
+        let mut fixed = std::mem::take(&mut self.fixed);
+        fixed.clear();
         let mut posed: FxHashMap<Shape, Vec<f32>> = FxHashMap::default();
-        let mut places = FxHashMap::default();
+        let mut what_blocks: FxHashMap<u64, Option<Blocks>> = FxHashMap::default();
+        self.frame += 1;
+        let frame = self.frame;
         for (handle, node) in graph.pair_iter() {
             let Some(mesh) = node.cast::<Mesh>() else {
                 continue;
             };
             let transform = node.global_transform();
-            if self
-                .places
-                .get(&handle)
-                .is_some_and(|was| !same_place(was, &transform))
-            {
-                self.moved.insert(handle);
+            let slot = handle.index() as usize;
+            if slot >= self.places.len() {
+                self.places.resize(slot + 1, None);
             }
-            places.insert(handle, transform);
+            let place = match &mut self.places[slot] {
+                Some(place) if place.handle == handle => {
+                    if !same_place(&place.transform, &transform) {
+                        place.transform = transform;
+                        place.still_since = frame;
+                        place.moved = true;
+                    }
+                    *place
+                }
+                other => *other.insert(Place {
+                    handle,
+                    transform,
+                    still_since: frame,
+                    moved: false,
+                }),
+            };
+            let settled = frame - place.still_since >= SETTLE_FRAMES;
             if !node.cast_shadows() {
                 continue;
             }
             let skinned = mesh.surfaces().iter().any(|s| !s.bones().is_empty());
-            if (skinned || self.moved.contains(&handle)) && !node.global_visibility() {
+            if (skinned || place.moved) && !node.global_visibility() {
                 continue;
             }
             for (n, surface) in mesh.surfaces().iter().enumerate() {
-                let Some(how) = blocks(surface.material()) else {
+                let material = surface.material();
+                let Some(how) = *what_blocks.entry(material.key()).or_insert_with(|| blocks(material))
+                else {
                     continue;
                 };
                 if surface.bones().is_empty() {
+                    if settled {
+                        fixed.push((BatchKey::new(&transform, how), handle, n, instance_transform(&transform)));
+                        continue;
+                    }
                     let glass = matches!(how, Blocks::Glass(_));
                     let shape = Shape::Shared(surface.data().key(), glass);
                     placed.push((shape, instance_transform(&transform), handle, n, how));
                 } else {
                     let shape = Shape::Posed(handle, n);
                     // Posed afresh near the camera, or for the first time; further off, as it was.
+                    // Either way, only if its bones have moved since it was last posed.
+                    let built = self.geometry.contains_key(&shape);
                     let near = camera.is_none_or(|camera| (node.global_position() - camera).norm() < SKIN_REACH);
-                    if near || !self.geometry.contains_key(&shape) {
-                        let skin = self.skins.entry(surface.data().key()).or_insert_with(|| Skin::read(surface));
-                        posed.insert(shape, skin.pose(graph, surface));
+                    if near || !built {
+                        let matrices = bone_matrices(graph, surface);
+                        let still = built && self.poses.get(&shape).is_some_and(|was| same_pose(was, &matrices));
+                        if !still {
+                            let skin = self.skins.entry(surface.data().key()).or_insert_with(|| Skin::read(surface));
+                            posed.insert(shape, skin.pose(&matrices));
+                            self.poses.insert(shape, matrices);
+                        }
                     }
                     let at = instance_transform(&Matrix4::identity());
                     placed.push((shape, at, handle, n, how));
                 }
             }
         }
-        self.places = places;
-        self.moved.retain(|handle| self.places.contains_key(handle));
+
+        // The still meshes put together again where one has come or gone.
+        let mut rebuilt = 0;
+        if fixed != self.was_fixed {
+            let mut by_key: FxHashMap<BatchKey, Vec<(Handle<Node>, usize, [f32; 12])>> = FxHashMap::default();
+            for &(key, handle, n, at) in &fixed {
+                by_key.entry(key).or_default().push((handle, n, at));
+            }
+            self.batches.retain(|key, _| by_key.contains_key(key));
+            // Each surface's data read once, however many meshes share it.
+            let mut read: FxHashMap<u64, (Vec<f32>, Vec<u32>)> = FxHashMap::default();
+            for (key, members) in by_key {
+                if self.batches.get(&key).is_some_and(|batch| batch.members == members) {
+                    continue;
+                }
+                self.batches.remove(&key);
+                let (mut vertices, mut indices) = (Vec::new(), Vec::new());
+                for &(handle, n, at) in &members {
+                    let Some(surface) = graph
+                        .try_get_node(handle)
+                        .ok()
+                        .and_then(|node| node.cast::<Mesh>())
+                        .and_then(|mesh| mesh.surfaces().get(n))
+                    else {
+                        continue;
+                    };
+                    let (local, triangles) = read.entry(surface.data().key()).or_insert_with(|| {
+                        let local = positions(graph, surface);
+                        let triangles = triangles(surface, local.len() / 3);
+                        (local, triangles)
+                    });
+                    append_placed(&mut vertices, &mut indices, local, triangles, &at);
+                }
+                if indices.is_empty() {
+                    continue;
+                }
+                let geometry = match key.glass {
+                    None => server.build_ray_traced_geometry(&vertices, &indices, false)?,
+                    Some(_) => server.build_ray_traced_glass(&vertices, &indices, false)?,
+                };
+                if let Some(geometry) = geometry {
+                    self.batches.insert(key, Batch { members, geometry });
+                    rebuilt += 1;
+                }
+            }
+        }
+        let fixed_same = rebuilt == 0 && fixed == self.was_fixed;
+        self.fixed = std::mem::replace(&mut self.was_fixed, fixed);
+
+        // Everything where it was last frame, and nothing posed afresh, the geometry is as it was.
+        let same = placed == self.was_placed;
+        let settled = same && posed.is_empty();
 
         // Geometry for shapes seen for the first time, and posed ones whose vertices changed in
         // number.
         let posed_vertices = |shape: &Shape| posed.get(shape);
         let mut built = 0;
-        for &(shape, _, handle, n, how) in &placed {
+        for &(shape, _, handle, n, how) in placed.iter().filter(|_| !settled) {
             let fresh = match self.geometry.get(&shape) {
                 None => true,
                 Some(had) => posed_vertices(&shape)
@@ -493,8 +690,14 @@ impl LightShadowTracer for TracedLightShadows {
             }
         }
         // Only what is still there.
-        let there: FxHashSet<Shape> = placed.iter().map(|(shape, ..)| *shape).collect();
-        self.geometry.retain(|shape, _| there.contains(shape));
+        if !same {
+            let there: FxHashSet<Shape> = placed.iter().map(|(shape, ..)| *shape).collect();
+            self.geometry.retain(|shape, _| there.contains(shape));
+            // A pose is kept only with the geometry it was put into: built afresh, it is posed
+            // afresh.
+            let geometry = &self.geometry;
+            self.poses.retain(|shape, _| geometry.contains_key(shape));
+        }
 
         // Posed geometry, refitted where it is this frame.
         let updates: Vec<(&RayTracedGeometry, &[f32])> = posed
@@ -507,9 +710,32 @@ impl LightShadowTracer for TracedLightShadows {
             .collect();
         server.update_ray_traced_geometry(&updates)?;
 
-        let instances: Vec<RayTracedInstance> = placed
-            .iter()
-            .filter_map(|(shape, transform, _, _, how)| {
+        // Nothing placed, built or refitted differently from last frame, the scene traced is
+        // still right as it is.
+        let unchanged = same
+            && fixed_same
+            && built == 0
+            && updates.is_empty()
+            && self.scene.borrow().is_some();
+        // What was placed this frame is kept to tell against the next; last frame's, to be filled
+        // again.
+        self.placed = std::mem::replace(&mut self.was_placed, placed);
+        if unchanged {
+            if self.tracer.is_none() {
+                self.tracer = server.create_shadow_tracer();
+            }
+            return Ok(());
+        }
+        let placed = &self.was_placed;
+
+        let identity = instance_transform(&Matrix4::identity());
+        let batched = self.batches.iter().map(|(key, batch)| RayTracedInstance {
+            geometry: &batch.geometry,
+            transform: identity,
+            lets_through: key.lets_through(),
+        });
+        let instances: Vec<RayTracedInstance> = batched
+            .chain(placed.iter().filter_map(|(shape, transform, _, _, how)| {
                 let geometry = self.geometry.get(shape)?;
                 // Posed geometry built solid stays so even if its surface turns to glass.
                 let lets_through = match how {
@@ -521,18 +747,21 @@ impl LightShadowTracer for TracedLightShadows {
                     transform: *transform,
                     lets_through,
                 })
-            })
+            }))
             .collect();
         let mut shared = self.scene.borrow_mut();
         match shared.as_mut() {
             Some(traced) => server.update_ray_traced_instances(traced, &instances)?,
             None => *shared = server.build_ray_traced_instances(&instances)?,
         }
-        if built > 0 {
+        if built > 0 || rebuilt > 0 {
             if let Some(traced) = shared.as_ref() {
                 Log::info(format!(
-                    "Ray traced shadows: {} pieces of geometry, {} copies, {} triangles",
+                    "Ray traced shadows: {} pieces of geometry, {} of still meshes ({} put together \
+                     again), {} copies, {} triangles",
                     self.geometry.len(),
+                    self.batches.len(),
+                    rebuilt,
                     instances.len(),
                     traced.triangle_count()
                 ));
@@ -622,4 +851,67 @@ fn matrix_to_array(matrix: &Matrix4<f32>) -> [[f32; 4]; 4] {
         values.copy_from_slice(column.as_slice());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bones_that_have_not_moved_need_no_posing_again() {
+        let still = vec![Matrix4::new_translation(&Vector3::new(1.0, 2.0, 3.0)), Matrix4::identity()];
+        assert!(same_pose(&still, &still.clone()));
+        // A drift too small to see is no move.
+        let drift = vec![Matrix4::new_translation(&Vector3::new(1.0 + MOVED * 0.5, 2.0, 3.0)), Matrix4::identity()];
+        assert!(same_pose(&still, &drift));
+        // But a bone that has moved is, and so is a different set of bones.
+        let moved = vec![Matrix4::new_translation(&Vector3::new(1.1, 2.0, 3.0)), Matrix4::identity()];
+        assert!(!same_pose(&still, &moved));
+        assert!(!same_pose(&still, &still[..1]));
+    }
+
+    #[test]
+    fn still_meshes_are_put_together_where_they_stand() {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let triangle = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let at = |x: f32| instance_transform(&Matrix4::new_translation(&Vector3::new(x, 0.0, 5.0)));
+        append_placed(&mut vertices, &mut indices, &triangle, &[0, 1, 2], &at(10.0));
+        append_placed(&mut vertices, &mut indices, &triangle, &[0, 1, 2], &at(20.0));
+        // The second copy's indices follow on from the first's vertices, and each is moved.
+        assert_eq!(indices, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(&vertices[..3], &[10.0, 0.0, 5.0]);
+        assert_eq!(&vertices[9..12], &[20.0, 0.0, 5.0]);
+        assert_eq!(&vertices[12..15], &[21.0, 0.0, 5.0]);
+    }
+
+    #[test]
+    fn still_meshes_go_together_by_cube_and_by_what_they_block() {
+        let at = |x: f32, y: f32| Matrix4::new_translation(&Vector3::new(x, y, -1.0));
+        let solid = BatchKey::new(&at(1.0, 2.0), Blocks::Solid);
+        assert_eq!(solid, BatchKey::new(&at(BATCH_CELL - 0.5, 2.0), Blocks::Solid));
+        assert_ne!(solid, BatchKey::new(&at(BATCH_CELL + 0.5, 2.0), Blocks::Solid));
+        // Floors over one another are apart, and so is everything below zero.
+        assert_ne!(solid, BatchKey::new(&at(1.0, BATCH_CELL + 2.0), Blocks::Solid));
+        assert_eq!(solid.cell[2], -1);
+        // Glass is apart from what is solid, and from glass letting through other light, and
+        // keeps what it lets through.
+        let red = BatchKey::new(&at(1.0, 2.0), Blocks::Glass([1.0, 0.2, 0.2]));
+        assert_ne!(solid, red);
+        assert_ne!(red, BatchKey::new(&at(1.0, 2.0), Blocks::Glass([0.2, 1.0, 0.2])));
+        assert_eq!(red.lets_through(), [1.0, 0.2, 0.2]);
+        assert_eq!(solid.lets_through(), [0.0; 3]);
+    }
+
+    #[test]
+    fn a_skin_is_posed_by_the_matrices_it_is_given() {
+        let skin = Skin {
+            positions: vec![Vector3::new(1.0, 0.0, 0.0)],
+            bones: vec![[0, 1, 0, 0]],
+            weights: vec![[0.5, 0.5, 0.0, 0.0]],
+        };
+        let matrices = [Matrix4::new_translation(&Vector3::new(0.0, 2.0, 0.0)), Matrix4::identity()];
+        let posed = skin.pose(&matrices);
+        assert!((posed[0] - 1.0).abs() < 1.0e-6 && (posed[1] - 1.0).abs() < 1.0e-6 && posed[2].abs() < 1.0e-6, "{posed:?}");
+    }
 }
