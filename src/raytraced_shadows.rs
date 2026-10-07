@@ -25,12 +25,14 @@
 //! once for every mesh made from the same surface data, such as a maze's repeated tiles - and every
 //! frame a copy of each is placed wherever its mesh is, so what moves casts its shadow from where
 //! it is. Most of a scene never moves, though, and placing thousands of copies every frame costs
-//! more than tracing against them: so a mesh that has stood still for a second
-//! ([`SETTLE_FRAMES`]) is put in with the others standing still in the same cube of space
+//! more than tracing against them: so a mesh that has never moved, a second after it appears
+//! ([`SETTLE_FRAMES`]), is put in with the others standing still in the same cube of space
 //! ([`BATCH_CELL`]), as one piece of geometry already where they all are, placed once. A maze of
 //! thousands of walls is traced as a few hundred pieces. When a mesh that was put in moves, or
-//! goes, or one comes to stand still beside them, only its cube is put together again; and when
-//! nothing has moved or changed since the last frame, the scene is not placed again at all.
+//! goes, or a new one appears beside them, only its cube is put together again; what has once
+//! moved stays a copy of its own from then on, so that what is carried about does not keep
+//! putting cubes together again. When nothing has moved or changed since the last frame, the
+//! scene is not placed again at all.
 //!
 //! A skinned mesh's triangles are skinned by its bones every frame, as the renderer draws
 //! them, and refitted - within [`SKIN_REACH`] of the camera; further off, its shadow stays as it
@@ -347,8 +349,8 @@ fn same_pose(a: &[Matrix4<f32>], b: &[Matrix4<f32>]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_place(a, b))
 }
 
-/// How long a mesh has to stand still, in frames, before it is put in with the others standing
-/// still round it ([`Batch`]).
+/// How long a mesh that has never moved has to have been there, in frames, before it is put in
+/// with the others standing still round it ([`Batch`]).
 const SETTLE_FRAMES: u64 = 60;
 
 /// How wide the cubes of space are whose still meshes are traced as one, in meters. Smaller, a
@@ -391,14 +393,18 @@ struct Place {
     moved: bool,
 }
 
-/// A still surface put in with others: which mesh and surface it is, and where.
-type Fixed = (BatchKey, Handle<Node>, usize, [f32; 12]);
+/// A still surface put in with others: which mesh and surface it is, and where; and its data,
+/// so that a surface given other data is put in again.
+type Fixed = (BatchKey, Member);
+
+/// A surface in a [`Batch`]: which mesh and surface it is, where, and the data it was built from.
+type Member = (Handle<Node>, usize, [f32; 12], u64);
 
 /// Still meshes traced as one piece of geometry, already where they are in the world: the
 /// hardware places one copy of it rather than one of each mesh, and nothing about it changes
 /// from frame to frame. A maze's thousands of walls, floors and lamps are a few dozen of these.
 struct Batch {
-    members: Vec<(Handle<Node>, usize, [f32; 12])>,
+    members: Vec<Member>,
     geometry: RayTracedGeometry,
 }
 
@@ -558,7 +564,10 @@ impl LightShadowTracer for TracedLightShadows {
                     moved: false,
                 }),
             };
-            let settled = frame - place.still_since >= SETTLE_FRAMES;
+            // Only what has never moved is put in with the rest: what has been carried about -
+            // the eyes on a droid's head, say - would come and go from it, each time putting
+            // its cube together again, when it lies still a while and when it goes.
+            let settled = !place.moved && frame - place.still_since >= SETTLE_FRAMES;
             if !node.cast_shadows() {
                 continue;
             }
@@ -574,7 +583,10 @@ impl LightShadowTracer for TracedLightShadows {
                 };
                 if surface.bones().is_empty() {
                     if settled {
-                        fixed.push((BatchKey::new(&transform, how), handle, n, instance_transform(&transform)));
+                        // Where it was last taken to be, not exactly where it is: a drift too
+                        // small to count as moving should not put its cube together again.
+                        let at = instance_transform(&place.transform);
+                        fixed.push((BatchKey::new(&place.transform, how), (handle, n, at, surface.data().key())));
                         continue;
                     }
                     let glass = matches!(how, Blocks::Glass(_));
@@ -604,9 +616,9 @@ impl LightShadowTracer for TracedLightShadows {
         // The still meshes put together again where one has come or gone.
         let mut rebuilt = 0;
         if fixed != self.was_fixed {
-            let mut by_key: FxHashMap<BatchKey, Vec<(Handle<Node>, usize, [f32; 12])>> = FxHashMap::default();
-            for &(key, handle, n, at) in &fixed {
-                by_key.entry(key).or_default().push((handle, n, at));
+            let mut by_key: FxHashMap<BatchKey, Vec<Member>> = FxHashMap::default();
+            for &(key, member) in &fixed {
+                by_key.entry(key).or_default().push(member);
             }
             self.batches.retain(|key, _| by_key.contains_key(key));
             // Each surface's data read once, however many meshes share it.
@@ -617,7 +629,7 @@ impl LightShadowTracer for TracedLightShadows {
                 }
                 self.batches.remove(&key);
                 let (mut vertices, mut indices) = (Vec::new(), Vec::new());
-                for &(handle, n, at) in &members {
+                for &(handle, n, at, _) in &members {
                     let Some(surface) = graph
                         .try_get_node(handle)
                         .ok()
