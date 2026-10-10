@@ -61,7 +61,7 @@ pub use occlusion::AmbientOcclusion;
 pub use raytraced_shadows::RayTracedShadows;
 pub use reflections::Reflections;
 pub use refraction::{replace_materials, GlassMaterial};
-pub use shadows::{LightBudget, ShadowBudget, SoftShadows};
+pub use shadows::{LightBudget, ShadowBudget, ShadowSwitch, SoftShadows};
 
 use fyrox::{
     core::{reflect::prelude::*, visitor::prelude::*},
@@ -128,6 +128,14 @@ pub struct GraphicsEffects {
     #[visit(skip)]
     #[reflect(hidden)]
     shadows_traced: bool,
+    /// Whether anything casts shadows, as the game says; and the renderer's shadow settings from
+    /// before they were switched off, while they are.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    shadow_switch: ShadowSwitch,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    shadows_before_off: Option<[bool; 3]>,
 }
 
 impl Default for GraphicsEffects {
@@ -153,6 +161,8 @@ impl Default for GraphicsEffects {
             #[cfg(feature = "raytracing")]
             area_light_pass: None,
             shadows_traced: false,
+            shadow_switch: ShadowSwitch::default(),
+            shadows_before_off: None,
         }
     }
 }
@@ -163,6 +173,11 @@ impl GraphicsEffects {
     /// executor stays connected.
     pub fn moving_things(&self) -> MovingThings {
         self.moving.clone()
+    }
+
+    /// The switch for shadows, on until the game turns it off - see [`ShadowSwitch`].
+    pub fn shadow_switch(&self) -> ShadowSwitch {
+        self.shadow_switch.clone()
     }
 
     /// The list of area lights, for the game to fill - see [`area_lights`]. Shared like
@@ -299,7 +314,11 @@ impl Plugin for GraphicsEffects {
                 self.shadows_traced = raytraced_shadows::is_supported(renderer.graphics_server());
                 if self.shadows_traced {
                     renderer.set_light_shadow_tracer(Some(Box::new(
-                        raytraced_shadows::TracedLightShadows::new(shadows, traced_scene),
+                        raytraced_shadows::TracedLightShadows::new(
+                            shadows,
+                            traced_scene,
+                            self.shadow_switch.clone(),
+                        ),
                     )));
                 }
             }
@@ -326,6 +345,10 @@ impl Plugin for GraphicsEffects {
     }
 
     fn update(&mut self, ctx: &mut PluginContext) -> GameResult {
+        if let GraphicsContext::Initialized(graphics_context) = &mut *ctx.graphics_context {
+            self.shadow_switch
+                .apply(&mut graphics_context.renderer, &mut self.shadows_before_off);
+        }
         if self.temporal_pass.is_some() {
             if let GraphicsContext::Initialized(graphics_context) = &mut *ctx.graphics_context {
                 self.temporal_frame += 1;
