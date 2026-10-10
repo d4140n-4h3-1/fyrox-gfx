@@ -324,50 +324,29 @@ fn viewpoint_of(scene: &Scene) -> Option<Vector3<f32>> {
         .map(|camera| camera.global_position())
 }
 
-/// Whether anything casts shadows at all: a switch the game holds, to turn them off for a scene
-/// that looks better without - one lit only by its own glow, say - and save what they cost.
-///
-/// Off, no shadow maps are drawn and nothing is traced: the scene is not built for tracing, so
-/// area lights shine through everything as they do where tracing is not supported. On again, it
-/// all comes back as it was. Shared like [`crate::MovingThings`]: a copy taken before the plugin
-/// is handed to the executor stays connected.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ShadowSwitch(std::rc::Rc<std::cell::Cell<bool>>);
-
-impl ShadowSwitch {
-    /// Turns shadows on or off, from the next frame.
-    pub fn set_enabled(&self, enabled: bool) {
-        self.0.set(!enabled);
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        !self.0.get()
-    }
-
-    /// Switches the renderer's shadow maps to follow the switch, if they do not already, keeping
-    /// how they were set to put them back. `applied` is what was last applied: `None` for
-    /// shadows as the renderer has them, or the settings they had before they were turned off.
-    pub(crate) fn apply(&self, renderer: &mut Renderer, applied: &mut Option<[bool; 3]>) {
-        let mut settings = renderer.get_quality_settings();
-        match (self.is_enabled(), applied.as_ref()) {
-            (false, None) => {
-                *applied = Some([
-                    settings.point_shadows_enabled,
-                    settings.spot_shadows_enabled,
-                    settings.csm_settings.enabled,
-                ]);
-                settings.point_shadows_enabled = false;
-                settings.spot_shadows_enabled = false;
-                settings.csm_settings.enabled = false;
-            }
-            (true, Some(&[point, spot, sun])) => {
-                *applied = None;
-                settings.point_shadows_enabled = point;
-                settings.spot_shadows_enabled = spot;
-                settings.csm_settings.enabled = sun;
-            }
-            _ => return,
+/// Switches the renderer's shadow maps to follow `enabled`, if they do not already, keeping how
+/// they were set to put them back. `applied` is what was last applied: `None` for shadows as the
+/// renderer has them, or the settings they had before they were turned off.
+pub(crate) fn follow_switch(enabled: bool, renderer: &mut Renderer, applied: &mut Option<[bool; 3]>) {
+    let mut settings = renderer.get_quality_settings();
+    match (enabled, applied.as_ref()) {
+        (false, None) => {
+            *applied = Some([
+                settings.point_shadows_enabled,
+                settings.spot_shadows_enabled,
+                settings.csm_settings.enabled,
+            ]);
+            settings.point_shadows_enabled = false;
+            settings.spot_shadows_enabled = false;
+            settings.csm_settings.enabled = false;
         }
-        fyrox::core::log::Log::verify(renderer.set_quality_settings(&settings));
+        (true, Some(&[point, spot, sun])) => {
+            *applied = None;
+            settings.point_shadows_enabled = point;
+            settings.spot_shadows_enabled = spot;
+            settings.csm_settings.enabled = sun;
+        }
+        _ => return,
     }
+    fyrox::core::log::Log::verify(renderer.set_quality_settings(&settings));
 }

@@ -61,7 +61,7 @@ pub use occlusion::AmbientOcclusion;
 pub use raytraced_shadows::RayTracedShadows;
 pub use reflections::Reflections;
 pub use refraction::{replace_materials, GlassMaterial};
-pub use shadows::{LightBudget, ShadowBudget, ShadowSwitch, SoftShadows};
+pub use shadows::{LightBudget, ShadowBudget, SoftShadows};
 
 use fyrox::{
     core::{reflect::prelude::*, visitor::prelude::*},
@@ -69,7 +69,31 @@ use fyrox::{
     plugin::{error::GameResult, Plugin, PluginContext},
 };
 use refraction::RefractionPass;
-use std::{any::TypeId, cell::RefCell, rc::Rc};
+use std::{
+    any::TypeId,
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
+
+/// A switch the game holds to turn an effect off, and on again, while it runs: for a scene that
+/// looks better without it, or to save what it costs. On until it is turned off. Shared like
+/// [`MovingThings`]: a copy taken before the plugin is handed to the executor stays connected.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Switch(Rc<Cell<bool>>);
+
+impl Switch {
+    /// Turns the effect on or off, from the next frame.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.0.set(!enabled);
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        !self.0.get()
+    }
+}
+
+/// The switch for shadows - see [`GraphicsEffects::shadow_switch`].
+pub type ShadowSwitch = Switch;
 
 /// Installs the crate's render passes into the renderer.
 #[derive(Debug, Visit, Reflect)]
@@ -136,6 +160,10 @@ pub struct GraphicsEffects {
     #[visit(skip)]
     #[reflect(hidden)]
     shadows_before_off: Option<[bool; 3]>,
+    /// Whether surfaces reflect, as the game says.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    reflection_switch: Switch,
 }
 
 impl Default for GraphicsEffects {
@@ -163,6 +191,7 @@ impl Default for GraphicsEffects {
             shadows_traced: false,
             shadow_switch: ShadowSwitch::default(),
             shadows_before_off: None,
+            reflection_switch: Switch::default(),
         }
     }
 }
@@ -175,9 +204,18 @@ impl GraphicsEffects {
         self.moving.clone()
     }
 
-    /// The switch for shadows, on until the game turns it off - see [`ShadowSwitch`].
-    pub fn shadow_switch(&self) -> ShadowSwitch {
+    /// The switch for shadows, on until the game turns it off. Off, no shadow maps are drawn and
+    /// nothing is traced: the scene is not built for tracing, so area lights shine through
+    /// everything as they do where tracing is not supported. On again, it all comes back as it
+    /// was.
+    pub fn shadow_switch(&self) -> Switch {
         self.shadow_switch.clone()
+    }
+
+    /// The switch for reflections, if there are any (see [`Self::with_reflections`]), on until
+    /// the game turns it off. Off, no rays are marched for them.
+    pub fn reflection_switch(&self) -> Switch {
+        self.reflection_switch.clone()
     }
 
     /// The list of area lights, for the game to fill - see [`area_lights`]. Shared like
@@ -327,6 +365,7 @@ impl Plugin for GraphicsEffects {
                 let pass = Rc::new(RefCell::new(reflections::ReflectionPass::new(
                     TypeId::of::<Self>(),
                     reflections,
+                    self.reflection_switch.clone(),
                 )));
                 graphics_context.renderer.add_render_pass(pass.clone());
                 self.reflection_pass = Some(pass);
@@ -346,8 +385,11 @@ impl Plugin for GraphicsEffects {
 
     fn update(&mut self, ctx: &mut PluginContext) -> GameResult {
         if let GraphicsContext::Initialized(graphics_context) = &mut *ctx.graphics_context {
-            self.shadow_switch
-                .apply(&mut graphics_context.renderer, &mut self.shadows_before_off);
+            shadows::follow_switch(
+                self.shadow_switch.is_enabled(),
+                &mut graphics_context.renderer,
+                &mut self.shadows_before_off,
+            );
         }
         if self.temporal_pass.is_some() {
             if let GraphicsContext::Initialized(graphics_context) = &mut *ctx.graphics_context {

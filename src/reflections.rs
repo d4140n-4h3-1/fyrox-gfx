@@ -91,6 +91,8 @@ pub struct ReflectionPass {
     pass_name: ImmutableString,
     shader: Option<RenderPassContainer>,
     copy: SceneCopy,
+    /// Whether to reflect at all.
+    switch: crate::Switch,
     /// Frames drawn, for the noise that spreads the rays to change every frame.
     frame: u32,
 }
@@ -104,13 +106,14 @@ impl std::fmt::Debug for ReflectionPass {
 }
 
 impl ReflectionPass {
-    pub fn new(source_type_id: TypeId, settings: Reflections) -> Self {
+    pub fn new(source_type_id: TypeId, settings: Reflections, switch: crate::Switch) -> Self {
         Self {
             source_type_id,
             settings,
             pass_name: ImmutableString::new("Primary"),
             shader: None,
             copy: SceneCopy::new("FyroxGfxReflectionSource"),
+            switch,
             frame: 0,
         }
     }
@@ -121,7 +124,7 @@ impl SceneRenderPass for ReflectionPass {
         &mut self,
         mut ctx: SceneRenderPassContext,
     ) -> Result<RenderPassStatistics, FrameworkError> {
-        if self.settings.strength <= 0.0 {
+        if self.settings.strength <= 0.0 || !self.switch.is_enabled() {
             return Ok(Default::default());
         }
 

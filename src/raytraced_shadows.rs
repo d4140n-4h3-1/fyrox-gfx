@@ -431,7 +431,7 @@ pub struct TracedLightShadows {
     tracer: Option<ShadowTracer>,
     scene: SharedScene,
     /// Whether to trace at all.
-    switch: crate::ShadowSwitch,
+    switch: crate::Switch,
     /// Which scene it traces.
     scene_handle: Option<Handle<Scene>>,
     /// Each shape's geometry, built once, and posed geometry refitted every frame.
@@ -469,7 +469,7 @@ impl std::fmt::Debug for TracedLightShadows {
 }
 
 impl TracedLightShadows {
-    pub(crate) fn new(settings: RayTracedShadows, scene: SharedScene, switch: crate::ShadowSwitch) -> Self {
+    pub(crate) fn new(settings: RayTracedShadows, scene: SharedScene, switch: crate::Switch) -> Self {
         Self {
             settings,
             tracer: None,
