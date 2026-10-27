@@ -13,6 +13,8 @@
 //! - [`reflections`]: ray-marched against the depth buffer. Off by default.
 //! - [`area_lights`] (feature `raytracing`): glowing rectangles that light what is round them,
 //!   with soft traced shadows where shadows are traced. Off until the game sets some.
+//! - [`double_sided`]: surfaces seen from both sides, for meshes whose faces disagree on which
+//!   way is in - a tube to walk through, say.
 //! - [`moving`]: what in the scene moves, which the game tells the effects every frame so that
 //!   temporal anti-aliasing does not leave a ghost behind it.
 //! - [`shadows::ShadowBudget`]: keeps shadow maps for the lights nearest the camera only, which is
@@ -42,6 +44,7 @@
 pub mod antialiasing;
 #[cfg(feature = "raytracing")]
 pub mod area_lights;
+pub mod double_sided;
 pub mod moving;
 pub mod occlusion;
 #[cfg(feature = "raytracing")]
@@ -53,6 +56,7 @@ pub mod shadows;
 pub mod temporal;
 
 pub use antialiasing::AntiAliasing;
+pub use double_sided::make_double_sided;
 #[cfg(feature = "raytracing")]
 pub use area_lights::{AreaLight, AreaLights};
 pub use moving::{MovingThing, MovingThings};
