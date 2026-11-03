@@ -44,6 +44,7 @@
 pub mod antialiasing;
 #[cfg(feature = "raytracing")]
 pub mod area_lights;
+pub mod distance_blur;
 pub mod double_sided;
 pub mod moving;
 pub mod occlusion;
@@ -56,6 +57,7 @@ pub mod shadows;
 pub mod temporal;
 
 pub use antialiasing::AntiAliasing;
+pub use distance_blur::DistanceBlur;
 pub use double_sided::make_double_sided;
 #[cfg(feature = "raytracing")]
 pub use area_lights::{AreaLight, AreaLights};
@@ -168,6 +170,14 @@ pub struct GraphicsEffects {
     #[visit(skip)]
     #[reflect(hidden)]
     reflection_switch: Switch,
+    /// Blurring what is far off, if wanted (see [`distance_blur`]), and whether it is on, as the
+    /// game says.
+    #[visit(skip)]
+    #[reflect(hidden)]
+    distance_blur: Option<DistanceBlur>,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    distance_blur_switch: Switch,
 }
 
 impl Default for GraphicsEffects {
@@ -196,6 +206,8 @@ impl Default for GraphicsEffects {
             shadow_switch: ShadowSwitch::default(),
             shadows_before_off: None,
             reflection_switch: Switch::default(),
+            distance_blur: None,
+            distance_blur_switch: Switch::default(),
         }
     }
 }
@@ -220,6 +232,18 @@ impl GraphicsEffects {
     /// the game turns it off. Off, no rays are marched for them.
     pub fn reflection_switch(&self) -> Switch {
         self.reflection_switch.clone()
+    }
+
+    /// The switch for blurring what is far off, if it is wanted (see
+    /// [`Self::with_distance_blur`]): on until the game turns it off.
+    pub fn distance_blur_switch(&self) -> Switch {
+        self.distance_blur_switch.clone()
+    }
+
+    /// Blurs what is far off, more the further (see [`distance_blur`]). Off by default.
+    pub fn with_distance_blur(mut self, blur: DistanceBlur) -> Self {
+        self.distance_blur = Some(blur);
+        self
     }
 
     /// The list of area lights, for the game to fill - see [`area_lights`]. Shared like
@@ -373,6 +397,15 @@ impl Plugin for GraphicsEffects {
                 )));
                 graphics_context.renderer.add_render_pass(pass.clone());
                 self.reflection_pass = Some(pass);
+            }
+            if let Some(blur) = self.distance_blur {
+                // Before the temporal pass, which smooths the softened frame.
+                let pass = Rc::new(RefCell::new(distance_blur::DistanceBlurPass::new(
+                    TypeId::of::<Self>(),
+                    blur,
+                    self.distance_blur_switch.clone(),
+                )));
+                graphics_context.renderer.add_render_pass(pass);
             }
             if temporal {
                 // Last, so it smooths everything drawn before it: glass and reflections too.
