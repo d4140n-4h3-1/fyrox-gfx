@@ -5,11 +5,11 @@
 //! Every surface is built into clusters at every level of detail once (`yoctite::build`), by its
 //! data, so the thousand copies of a tree share one; its vertices and clusters go into the pool
 //! (`fyrox_graphics_wgpu::yoctite::GeometryPool`), and each mesh node's surfaces are placed in
-//! it as instances, which move with their nodes and go when they do. Each frame, the clusters
-//! to draw are chosen on the CPU - instances out of the view left out, then for each the cut
-//! through its clusters whose error looks no bigger than a pixel (`yoctite::select`) - and drawn
-//! in one draw. The next phase makes that choice on the GPU; this is its reference, and a way to
-//! see the clusters.
+//! it as instances, which move with their nodes and go when they do. Each frame, the clusters to
+//! draw are chosen - instances out of the view left out, then for each the cut through its
+//! clusters whose error looks no bigger than a pixel - and drawn in one draw. They are chosen on
+//! the GPU (`fyrox_graphics_wgpu::yoctite::Culler`), the draw made from its list without the CPU
+//! seeing it; or, as a reference, on the CPU (`yoctite::select`).
 
 use fyrox::{
     core::{
@@ -37,7 +37,7 @@ use fyrox::{
 };
 use fyrox_graphics_wgpu::{
     server::WgpuGraphicsServer,
-    yoctite::{ClusterView, GeometryPool, InstanceId, MeshId, PoolVertex},
+    yoctite::{ClusterView, Culler, GeometryPool, InstanceId, MeshId, PoolVertex},
 };
 use std::{any::TypeId, collections::hash_map::Entry, sync::Arc, time::Instant};
 use yoctite::ClusterDag;
@@ -76,10 +76,15 @@ pub struct YoctiteViewPass {
     placed: FxHashMap<(Handle<Node>, usize), Placed>,
     frame: u64,
     failed: bool,
+    /// Whether the clusters are chosen on the GPU, or on the CPU, as a reference.
+    on_gpu: bool,
+    culler: Option<Culler>,
+    overflow_reported: bool,
 }
 
 impl YoctiteViewPass {
-    pub(crate) fn new(source_type_id: TypeId) -> Self {
+    /// The view, choosing its clusters on the GPU, or `on_gpu` false on the CPU.
+    pub(crate) fn new(source_type_id: TypeId, on_gpu: bool) -> Self {
         Self {
             source_type_id,
             pool: None,
@@ -89,6 +94,9 @@ impl YoctiteViewPass {
             placed: Default::default(),
             frame: 0,
             failed: false,
+            on_gpu,
+            culler: None,
+            overflow_reported: false,
         }
     }
 }
@@ -223,46 +231,50 @@ impl YoctiteViewPass {
             ));
         }
     }
+}
 
-    /// The clusters to draw from where the camera is, as instance slots and pool clusters, and
-    /// how many triangles they come to.
-    fn choose(&self, view_projection: &Matrix4<f32>, eye: Vector3<f32>, threshold: f32) -> (Vec<[u32; 2]>, usize) {
-        let mut list = Vec::new();
-        let mut triangles = 0;
-        let Some(pool) = &self.pool else {
-            return (list, 0);
+/// The clusters to draw from where the camera is, chosen on the CPU, as instance slots and pool
+/// clusters, and how many triangles they come to: the reference for the GPU's choice.
+fn choose(
+    built: &FxHashMap<u64, Built>,
+    placed: &FxHashMap<(Handle<Node>, usize), Placed>,
+    pool: &GeometryPool,
+    view_projection: &Matrix4<f32>,
+    eye: Vector3<f32>,
+    threshold: f32,
+) -> (Vec<[u32; 2]>, usize) {
+    let mut list = Vec::new();
+    let mut triangles = 0;
+    let by_mesh: FxHashMap<MeshId, &Built> = built.values().map(|b| (b.mesh, b)).collect();
+    for placed in placed.values() {
+        let Some(record) = pool.instance(placed.instance) else {
+            continue;
         };
-        let by_mesh: FxHashMap<MeshId, &Built> = self.built.values().map(|b| (b.mesh, b)).collect();
-        for placed in self.placed.values() {
-            let Some(record) = pool.instance(placed.instance) else {
-                continue;
-            };
-            let Some(built) = by_mesh.get(&MeshId(record.mesh)) else {
-                continue;
-            };
-            let Some(mesh) = pool.mesh(built.mesh) else {
-                continue;
-            };
-            let t = &placed.transform;
-            let scale = (0..3)
-                .map(|c| t.column(c).xyz().norm())
-                .fold(0.0, f32::max);
-            let center = t.transform_point(&Point3::new(mesh.bounds[0], mesh.bounds[1], mesh.bounds[2]));
-            if !in_view(view_projection, center.coords, mesh.bounds[3] * scale) {
-                continue;
-            }
-            // In the mesh's own space, where its errors and bounds are.
-            let Some(inverse) = t.try_inverse() else {
-                continue;
-            };
-            let local = inverse.transform_point(&Point3::from(eye));
-            for c in yoctite::select(&built.dag, [local.x, local.y, local.z], threshold) {
-                triangles += built.dag.clusters[c as usize].triangles.len();
-                list.push([placed.instance.0, mesh.first_cluster + c]);
-            }
+        let Some(built) = by_mesh.get(&MeshId(record.mesh)) else {
+            continue;
+        };
+        let Some(mesh) = pool.mesh(built.mesh) else {
+            continue;
+        };
+        let t = &placed.transform;
+        let scale = (0..3)
+            .map(|c| t.column(c).xyz().norm())
+            .fold(0.0, f32::max);
+        let center = t.transform_point(&Point3::new(mesh.bounds[0], mesh.bounds[1], mesh.bounds[2]));
+        if !in_view(view_projection, center.coords, mesh.bounds[3] * scale) {
+            continue;
         }
-        (list, triangles)
+        // In the mesh's own space, where its errors and bounds are.
+        let Some(inverse) = t.try_inverse() else {
+            continue;
+        };
+        let local = inverse.transform_point(&Point3::from(eye));
+        for c in yoctite::select(&built.dag, [local.x, local.y, local.z], threshold) {
+            triangles += built.dag.clusters[c as usize].triangles.len();
+            list.push([placed.instance.0, mesh.first_cluster + c]);
+        }
     }
+    (list, triangles)
 }
 
 impl SceneRenderPass for YoctiteViewPass {
@@ -287,24 +299,38 @@ impl SceneRenderPass for YoctiteViewPass {
         // An error as big as a pixel: the view's height in radians over its height in pixels.
         let fov = 2.0 * (1.0 / position.projection_matrix[(1, 1)]).atan();
         let threshold = fov / viewport.h().max(1) as f32;
-        let started = Instant::now();
-        let (list, triangles) = self.choose(&position.view_projection_matrix, position.translation, threshold);
-        let chose = started.elapsed().as_secs_f64();
-
         let mut view_projection = [[0.0; 4]; 4];
         for (column, values) in position.view_projection_matrix.column_iter().zip(view_projection.iter_mut()) {
             values.copy_from_slice(column.as_slice());
         }
+        let eye = position.translation;
+        let (width, height) = (viewport.w() as u32, viewport.h() as u32);
         let view = self.view.get_or_insert_with(|| ClusterView::new(&server.state.device));
         let pool = self.pool.as_ref().expect("made by sync");
-        let drawn = match view.draw(
-            server,
-            pool,
-            view_projection,
-            viewport.w() as u32,
-            viewport.h() as u32,
-            &list,
-        ) {
+        let started = Instant::now();
+        let (drawn, chosen) = if self.on_gpu {
+            let culler = self.culler.get_or_insert_with(|| Culler::new(&server.state.device));
+            let drawn = view.draw_culled(server, pool, culler, view_projection, eye.into(), threshold, width, height);
+            // What the GPU chose, read back a frame or two late.
+            let chosen = culler.stats().map(|stats| {
+                if stats.overflowed && !self.overflow_reported {
+                    Log::warn(format!(
+                        "Yoctite view: {} clusters chosen, more than the draw list held; it holds {} from now on",
+                        stats.clusters,
+                        culler.capacity()
+                    ));
+                    self.overflow_reported = true;
+                }
+                (stats.clusters as usize, stats.triangles as usize)
+            });
+            (drawn, chosen)
+        } else {
+            let (list, triangles) = choose(&self.built, &self.placed, pool, &position.view_projection_matrix, eye, threshold);
+            let drawn = view.draw(server, pool, view_projection, width, height, &list);
+            (drawn, Some((list.len(), triangles)))
+        };
+        let chose = started.elapsed().as_secs_f64();
+        let drawn = match drawn {
             Ok(texture) => texture,
             Err(err) => {
                 Log::err(format!("Yoctite view failed: {err:?}"));
@@ -312,12 +338,14 @@ impl SceneRenderPass for YoctiteViewPass {
                 return Ok(Default::default());
             }
         };
+        let (clusters, triangles) = chosen.unwrap_or_default();
         if self.frame % STATS_EVERY == 1 {
             Log::info(format!(
-                "Yoctite view: {} clusters, {} triangles; the pool kept up with the scene in {:.2} ms, \
-                 clusters chosen in {:.2} ms",
-                list.len(),
+                "Yoctite view: {} clusters, {} triangles, chosen on the {}; the pool kept up with the scene \
+                 in {:.2} ms, choosing and drawing took the CPU {:.2} ms",
+                clusters,
                 triangles,
+                if self.on_gpu { "GPU" } else { "CPU" },
                 synced * 1000.0,
                 chose * 1000.0
             ));

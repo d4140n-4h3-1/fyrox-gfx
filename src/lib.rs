@@ -107,10 +107,11 @@ pub type ShadowSwitch = Switch;
 #[derive(Debug, Visit, Reflect)]
 #[reflect(non_cloneable, type_uuid = "b6e3f1f2-8d0a-4c1e-a1f7-2c5b9e4d7a10")]
 pub struct GraphicsEffects {
-    /// Whether to draw Yoctite's cluster view over the frame.
+    /// Whether to draw Yoctite's cluster view over the frame, and whether it chooses its clusters
+    /// on the GPU.
     #[visit(skip)]
     #[reflect(hidden)]
-    yoctite_view: bool,
+    yoctite_view: Option<bool>,
     #[visit(skip)]
     #[reflect(hidden)]
     refraction: Option<Rc<RefCell<RefractionPass>>>,
@@ -189,7 +190,7 @@ pub struct GraphicsEffects {
 impl Default for GraphicsEffects {
     fn default() -> Self {
         Self {
-            yoctite_view: false,
+            yoctite_view: None,
             refraction: None,
             soft_shadows: Some(SoftShadows::default()),
             anti_aliasing: Some(AntiAliasing::default()),
@@ -250,9 +251,17 @@ impl GraphicsEffects {
     /// Blurs what is far off, more the further (see [`distance_blur`]). Off by default.
     /// Draws Yoctite's cluster view over the frame: the scene's meshes as Yoctite's clusters, each
     /// in a colour of its own, at the level of detail each would be drawn at (see
-    /// [`yoctite::YoctiteViewPass`]). Needs the wgpu backend and the `raytracing` feature.
+    /// [`yoctite::YoctiteViewPass`]), chosen on the GPU. Needs the wgpu backend and the
+    /// `raytracing` feature.
     pub fn with_yoctite_view(mut self) -> Self {
-        self.yoctite_view = true;
+        self.yoctite_view = Some(true);
+        self
+    }
+
+    /// As [`Self::with_yoctite_view`], but the clusters chosen on the CPU: the reference the GPU's
+    /// choice is held to.
+    pub fn with_yoctite_view_on_cpu(mut self) -> Self {
+        self.yoctite_view = Some(false);
         self
     }
 
@@ -433,10 +442,11 @@ impl Plugin for GraphicsEffects {
             }
             // After everything, temporal smoothing too, so its colours are its own.
             #[cfg(feature = "raytracing")]
-            if self.yoctite_view
-                && raytraced_shadows::is_supported_backend(graphics_context.renderer.graphics_server())
+            if let Some(on_gpu) = self
+                .yoctite_view
+                .filter(|_| raytraced_shadows::is_supported_backend(graphics_context.renderer.graphics_server()))
             {
-                let pass = Rc::new(RefCell::new(yoctite::YoctiteViewPass::new(TypeId::of::<Self>())));
+                let pass = Rc::new(RefCell::new(yoctite::YoctiteViewPass::new(TypeId::of::<Self>(), on_gpu)));
                 graphics_context.renderer.add_render_pass(pass);
             }
         }
