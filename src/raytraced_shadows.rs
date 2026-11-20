@@ -48,6 +48,15 @@
 //! tint, as strongly as its tint strength; glass told not to colour light
 //! ([`crate::GlassMaterial::tints_light`]) is left out, and light goes through it as if it were not
 //! there. The light is only coloured, not bent: where the glass would focus it, it does not.
+//!
+//! Leaves, needles and grass are usually cards: a few triangles each, with a texture whose alpha
+//! says where the leaf is, and the renderer leaves the rest undrawn where alpha falls below a
+//! half. Traced as plain triangles they would cast the shadow of the card, a solid rectangle; so a
+//! surface whose material's diffuse texture (times its diffuse colour's alpha) has any texel the
+//! renderer would leave undrawn is traced as a cutout instead, stopping light only where it is
+//! drawn ([`fyrox_graphics_wgpu::raytracing::CutoutMask`], made once per texture). Cutouts are
+//! never put in with the still meshes: a forest is thousands of copies of a few trees, and
+//! placing a copy of each shape is far less than every tree's foliage put together.
 
 use fyrox::{
     core::{
@@ -77,10 +86,10 @@ use fyrox::{
         Scene,
     },
 };
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 use fyrox_graphics_wgpu::{
     raytracing::{
-        RayTracedGeometry, RayTracedInstance, RayTracedScene, ShadowRayLight,
+        CutoutMask, RayTracedGeometry, RayTracedInstance, RayTracedScene, ShadowRayLight,
         ShadowRayParameters, ShadowTracer,
     },
     server::WgpuGraphicsServer,
@@ -143,18 +152,125 @@ pub(crate) fn is_supported_backend(server: &dyn GraphicsServer) -> bool {
 }
 
 /// How a surface of `material` stands in the way of light: solid, glass that lets through so
-/// much of a light's red, green and blue, or not at all.
+/// much of a light's red, green and blue, a cutout solid only where the mask kept under this key
+/// says (see [`Masks`]), or not at all.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Blocks {
     Solid,
     Glass([f32; 3]),
+    Cutout(u64),
+}
+
+/// The renderer's alpha test: a texel whose alpha, times the diffuse colour's, falls below this
+/// is left undrawn (the standard and glTF shaders' G-buffer pass).
+const ALPHA_TEST: f32 = 0.5;
+
+/// The widest and highest a cutout mask is made, in texels: a bigger texture is sampled every
+/// so many texels. Finer than this makes no difference a shadow shows.
+const MASK_LIMIT: u32 = 1024;
+
+/// The cutout masks made so far, by texture and the diffuse colour's alpha (see [`mask_key`]):
+/// [`None`] for a texture with every texel drawn, which is traced solid.
+type Masks = FxHashMap<u64, Option<Arc<CutoutMask>>>;
+
+/// The key a mask of `texture`, with diffuse alpha `alpha`, is kept under.
+fn mask_key(texture: u64, alpha: u8) -> u64 {
+    texture.rotate_left(8) ^ alpha as u64
+}
+
+/// Which texels of `texture` the renderer draws, with every alpha first multiplied by `alpha`:
+/// [`None`] if it draws them all, or if its texels cannot be read here (a compressed format).
+fn cutout_mask(texture: &fyrox::resource::texture::Texture, alpha: f32) -> Option<CutoutMask> {
+    use fyrox::resource::texture::{TextureKind, TexturePixelKind};
+    let TextureKind::Rectangle { width, height } = texture.kind() else {
+        return None;
+    };
+    // Where in each texel its alpha is, and how many bytes a texel takes.
+    let (stride, at, wide) = match texture.pixel_kind() {
+        TexturePixelKind::RGBA8 | TexturePixelKind::SRGBA8 | TexturePixelKind::BGRA8 => (4, 3, false),
+        TexturePixelKind::LuminanceAlpha8 => (2, 1, false),
+        TexturePixelKind::RGBA16 => (8, 6, true),
+        _ => return None,
+    };
+    let data = texture.mip_level_data(0);
+    if width == 0 || height == 0 || data.len() < width as usize * height as usize * stride {
+        return None;
+    }
+    let drawn = |x: u32, y: u32| {
+        let i = (y as usize * width as usize + x as usize) * stride + at;
+        let texel = if wide {
+            u16::from_le_bytes([data[i], data[i + 1]]) as f32 / 65535.0
+        } else {
+            data[i] as f32 / 255.0
+        };
+        texel * alpha >= ALPHA_TEST
+    };
+    let step = |size: u32| size.div_ceil(MASK_LIMIT).max(1);
+    let (sx, sy) = (step(width), step(height));
+    let mask = CutoutMask::new(width.div_ceil(sx), height.div_ceil(sy), |x, y| {
+        drawn((x * sx).min(width - 1), (y * sy).min(height - 1))
+    });
+    let all_drawn = (0..mask.height()).all(|y| (0..mask.width()).all(|x| mask.is_solid(x, y)));
+    (!all_drawn).then_some(mask)
+}
+
+/// `material`'s own value of the property `name`, if it sets one.
+fn property<'a>(material: &'a fyrox::material::Material, name: &str) -> Option<&'a MaterialProperty> {
+    material
+        .property_group_ref(ImmutableString::new("properties"))?
+        .property_ref(name)
+}
+
+/// Whether a surface of `material` is a cutout, and the key of its mask in `masks` if so, making
+/// the mask if it has not been made: see [`Blocks::Cutout`]. Not while its texture is loading.
+fn cutout(material: &fyrox::material::Material, masks: &mut Masks) -> Option<u64> {
+    let texture = material.texture_ref("diffuseTexture")?.value.clone()?;
+    let alpha = match property(material, "diffuseColor") {
+        Some(MaterialProperty::Color(color)) => color.a,
+        _ => 255,
+    };
+    let key = mask_key(texture.key(), alpha);
+    if let Some(mask) = masks.get(&key) {
+        return mask.is_some().then_some(key);
+    }
+    let state = texture.state();
+    let texture = state.data_ref()?;
+    let mask = cutout_mask(&texture, alpha as f32 / 255.0).map(Arc::new);
+    let is_cutout = mask.is_some();
+    masks.insert(key, mask);
+    is_cutout.then_some(key)
+}
+
+/// The texture coordinates of `surface`'s first `count` vertices, two floats each, as the
+/// renderer samples its diffuse texture with: scaled by `material`'s `texCoordScale`, if it has
+/// one.
+fn texture_coordinates(surface: &Surface, count: usize) -> Vec<f32> {
+    let scale = surface
+        .material()
+        .state()
+        .data_ref()
+        .and_then(|material| match property(&material, "texCoordScale") {
+            Some(MaterialProperty::Vector2(scale)) => Some(*scale),
+            _ => None,
+        })
+        .unwrap_or(fyrox::core::algebra::Vector2::new(1.0, 1.0));
+    let data = surface.data();
+    let data = data.data_ref();
+    let mut out = Vec::with_capacity(count * 2);
+    for vertex in data.vertex_buffer.iter().take(count) {
+        let uv = vertex
+            .read_2_f32(VertexAttributeUsage::TexCoord0)
+            .unwrap_or_default();
+        out.extend_from_slice(&[uv.x * scale.x, uv.y * scale.y]);
+    }
+    out
 }
 
 /// How a surface of `material` stands in the way of light, if it does. Glass lets light through,
 /// taking on its tint as much as its tint strength says, unless it is told not to colour light,
 /// when it is left out as if it were not there. Any other material that draws into no shadow
-/// maps is left out too.
-fn blocks(material: &MaterialResource) -> Option<Blocks> {
+/// maps is left out too. One with texels the renderer leaves undrawn is a cutout.
+fn blocks(material: &MaterialResource, masks: &mut Masks) -> Option<Blocks> {
     let material = material.state();
     let Some(material) = material.data_ref() else {
         return Some(Blocks::Solid);
@@ -189,7 +305,10 @@ fn blocks(material: &MaterialResource) -> Option<Blocks> {
         .disabled_passes
         .iter()
         .any(|pass| pass == "PointShadow");
-    (!opted_out).then_some(Blocks::Solid)
+    if opted_out {
+        return None;
+    }
+    Some(cutout(&material, masks).map_or(Blocks::Solid, Blocks::Cutout))
 }
 
 /// How far a mesh may drift, in meters, before it counts as having moved.
@@ -372,7 +491,8 @@ impl BatchKey {
         Self {
             cell: [cell(0), cell(1), cell(2)],
             glass: match how {
-                Blocks::Solid => None,
+                // Cutouts are never batched; were one, it would be traced solid.
+                Blocks::Solid | Blocks::Cutout(_) => None,
                 Blocks::Glass(through) => Some(through.map(f32::to_bits)),
             },
         }
@@ -416,9 +536,28 @@ type Placed = (Shape, [f32; 12], Handle<Node>, usize, Blocks);
 /// data, or, skinned, its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Shape {
-    /// With whether it is glass: the same data could be drawn solid and as glass.
-    Shared(u64, bool),
+    /// With how it is traced: the same data could be drawn solid, as glass, or as a cutout of
+    /// one texture or another.
+    Shared(u64, Traced),
     Posed(Handle<Node>, usize),
+}
+
+/// How a shape is traced: solid, as glass, or as a cutout with the mask kept under this key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Traced {
+    Solid,
+    Glass,
+    Cutout(u64),
+}
+
+impl From<Blocks> for Traced {
+    fn from(how: Blocks) -> Self {
+        match how {
+            Blocks::Solid => Self::Solid,
+            Blocks::Glass(_) => Self::Glass,
+            Blocks::Cutout(mask) => Self::Cutout(mask),
+        }
+    }
 }
 
 /// The scene as traced, shared with the area lights ([`crate::area_lights`]), which trace
@@ -455,6 +594,8 @@ pub struct TracedLightShadows {
     /// posed again.
     skins: FxHashMap<u64, Skin>,
     poses: FxHashMap<Shape, Vec<Matrix4<f32>>>,
+    /// The cutout masks made so far, kept for as long as the scene is traced.
+    masks: Masks,
     unsupported_reported: bool,
 }
 
@@ -486,6 +627,7 @@ impl TracedLightShadows {
             was_fixed: Default::default(),
             skins: Default::default(),
             poses: Default::default(),
+            masks: Default::default(),
             unsupported_reported: false,
         }
     }
@@ -529,6 +671,7 @@ impl LightShadowTracer for TracedLightShadows {
             self.was_fixed.clear();
             self.skins.clear();
             self.poses.clear();
+            self.masks.clear();
             self.scene_handle = Some(scene_handle);
         }
         let graph = &scene.graph;
@@ -588,20 +731,22 @@ impl LightShadowTracer for TracedLightShadows {
             }
             for (n, surface) in mesh.surfaces().iter().enumerate() {
                 let material = surface.material();
-                let Some(how) = *what_blocks.entry(material.key()).or_insert_with(|| blocks(material))
+                let masks = &mut self.masks;
+                let Some(how) = *what_blocks
+                    .entry(material.key())
+                    .or_insert_with(|| blocks(material, masks))
                 else {
                     continue;
                 };
                 if surface.bones().is_empty() {
-                    if settled {
+                    if settled && !matches!(how, Blocks::Cutout(_)) {
                         // Where it was last taken to be, not exactly where it is: a drift too
                         // small to count as moving should not put its cube together again.
                         let at = instance_transform(&place.transform);
                         fixed.push((BatchKey::new(&place.transform, how), (handle, n, at, surface.data().key())));
                         continue;
                     }
-                    let glass = matches!(how, Blocks::Glass(_));
-                    let shape = Shape::Shared(surface.data().key(), glass);
+                    let shape = Shape::Shared(surface.data().key(), how.into());
                     placed.push((shape, instance_transform(&transform), handle, n, how));
                 } else {
                     let shape = Shape::Posed(handle, n);
@@ -703,9 +848,17 @@ impl LightShadowTracer for TracedLightShadows {
             };
             let indices = triangles(surface, vertices.len() / 3);
             let updatable = matches!(shape, Shape::Posed(..));
-            let geometry = match how {
-                Blocks::Solid => server.build_ray_traced_geometry(&vertices, &indices, updatable)?,
-                Blocks::Glass(_) => server.build_ray_traced_glass(&vertices, &indices, updatable)?,
+            let mask = match how {
+                Blocks::Cutout(key) => self.masks.get(&key).cloned().flatten(),
+                _ => None,
+            };
+            let geometry = match (how, mask) {
+                (Blocks::Cutout(_), Some(mask)) => {
+                    let uvs = texture_coordinates(surface, vertices.len() / 3);
+                    server.build_ray_traced_cutout(&vertices, &indices, &uvs, mask, updatable)?
+                }
+                (Blocks::Glass(_), _) => server.build_ray_traced_glass(&vertices, &indices, updatable)?,
+                _ => server.build_ray_traced_geometry(&vertices, &indices, updatable)?,
             };
             if let Some(geometry) = geometry {
                 self.geometry.insert(shape, geometry);
@@ -879,6 +1032,48 @@ fn matrix_to_array(matrix: &Matrix4<f32>) -> [[f32; 4]; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `size` by `size` RGBA texture, its alpha `alpha(x, y)`.
+    fn texture(size: u32, alpha: impl Fn(u32, u32) -> u8) -> fyrox::resource::texture::Texture {
+        use fyrox::resource::texture::{Texture, TextureKind, TexturePixelKind};
+        let mut bytes = Vec::new();
+        for y in 0..size {
+            for x in 0..size {
+                bytes.extend_from_slice(&[40, 120, 30, alpha(x, y)]);
+            }
+        }
+        Texture::from_bytes(TextureKind::Rectangle { width: size, height: size }, TexturePixelKind::RGBA8, bytes)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_cutout_is_solid_where_the_renderer_draws() {
+        // A leaf in the left half; the right half left undrawn.
+        let leaf = texture(8, |x, _| if x < 4 { 255 } else { 0 });
+        let mask = cutout_mask(&leaf, 1.0).expect("a cutout");
+        assert_eq!((mask.width(), mask.height()), (8, 8));
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(mask.is_solid(x, y), x < 4, "{x}, {y}");
+            }
+        }
+        // Texels at 0.6 are drawn, but not once the diffuse colour halves them.
+        let faint = texture(4, |_, _| 153);
+        assert!(cutout_mask(&faint, 1.0).is_none());
+        assert!(cutout_mask(&faint, 0.5).is_some());
+    }
+
+    #[test]
+    fn a_texture_drawn_all_over_is_traced_solid() {
+        assert!(cutout_mask(&texture(4, |_, _| 255), 1.0).is_none());
+    }
+
+    #[test]
+    fn a_big_texture_gives_a_smaller_mask() {
+        let mask = cutout_mask(&texture(2048, |x, _| if x < 1024 { 255 } else { 0 }), 1.0).unwrap();
+        assert_eq!((mask.width(), mask.height()), (1024, 1024));
+        assert!(mask.is_solid(511, 3) && !mask.is_solid(512, 3));
+    }
 
     #[test]
     fn bones_that_have_not_moved_need_no_posing_again() {
