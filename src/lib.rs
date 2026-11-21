@@ -185,6 +185,18 @@ pub struct GraphicsEffects {
     #[visit(skip)]
     #[reflect(hidden)]
     distance_blur_switch: Switch,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    distance_blur_pass: Option<Rc<RefCell<distance_blur::DistanceBlurPass>>>,
+    /// Yoctite's pass, and whether it told the renderer to leave meshes to it.
+    #[cfg(feature = "raytracing")]
+    #[visit(skip)]
+    #[reflect(hidden)]
+    yoctite_pass: Option<Rc<RefCell<yoctite::YoctitePass>>>,
+    #[cfg(feature = "raytracing")]
+    #[visit(skip)]
+    #[reflect(hidden)]
+    meshes_taken_over: bool,
 }
 
 impl Default for GraphicsEffects {
@@ -217,6 +229,11 @@ impl Default for GraphicsEffects {
             reflection_switch: Switch::default(),
             distance_blur: None,
             distance_blur_switch: Switch::default(),
+            distance_blur_pass: None,
+            #[cfg(feature = "raytracing")]
+            yoctite_pass: None,
+            #[cfg(feature = "raytracing")]
+            meshes_taken_over: false,
         }
     }
 }
@@ -249,7 +266,6 @@ impl GraphicsEffects {
         self.distance_blur_switch.clone()
     }
 
-    /// Blurs what is far off, more the further (see [`distance_blur`]). Off by default.
     /// Draws the scene's meshes with Yoctite, in place of the renderer: as clusters at the level
     /// of detail each needs from the camera, chosen on the GPU, into the G-Buffer, a draw for
     /// each material (see [`yoctite::YoctitePass`]). Meshes it cannot draw as the engine does stay
@@ -277,6 +293,7 @@ impl GraphicsEffects {
         self
     }
 
+    /// Blurs what is far off, more the further (see [`distance_blur`]). Off by default.
     pub fn with_distance_blur(mut self, blur: DistanceBlur) -> Self {
         self.distance_blur = Some(blur);
         self
@@ -441,7 +458,8 @@ impl Plugin for GraphicsEffects {
                     blur,
                     self.distance_blur_switch.clone(),
                 )));
-                graphics_context.renderer.add_render_pass(pass);
+                graphics_context.renderer.add_render_pass(pass.clone());
+                self.distance_blur_pass = Some(pass);
             }
             if temporal {
                 // Last, so it smooths everything drawn before it: glass and reflections too.
@@ -464,8 +482,10 @@ impl Plugin for GraphicsEffects {
                     graphics_context.renderer.set_taken_over_meshes(Some(set.clone()));
                     set
                 });
+                self.meshes_taken_over = taken_over.is_some();
                 let pass = Rc::new(RefCell::new(yoctite::YoctitePass::new(TypeId::of::<Self>(), mode, taken_over)));
-                graphics_context.renderer.add_render_pass(pass);
+                graphics_context.renderer.add_render_pass(pass.clone());
+                self.yoctite_pass = Some(pass);
             }
         }
         Ok(())
@@ -523,6 +543,13 @@ impl Plugin for GraphicsEffects {
         self.refraction = None;
         self.reflection_pass = None;
         self.temporal_pass = None;
+        self.distance_blur_pass = None;
+        #[cfg(feature = "raytracing")]
+        {
+            self.area_light_pass = None;
+            self.yoctite_pass = None;
+            self.meshes_taken_over = false;
+        }
         Ok(())
     }
 
@@ -539,6 +566,22 @@ impl Plugin for GraphicsEffects {
                 graphics_context
                     .renderer
                     .set_projection_jitter(Default::default());
+            }
+            if let Some(pass) = self.distance_blur_pass.take() {
+                graphics_context.renderer.remove_render_pass(pass);
+            }
+            #[cfg(feature = "raytracing")]
+            {
+                if let Some(pass) = self.area_light_pass.take() {
+                    graphics_context.renderer.remove_render_pass(pass);
+                }
+                if let Some(pass) = self.yoctite_pass.take() {
+                    graphics_context.renderer.remove_render_pass(pass);
+                }
+                // The renderer draws every mesh itself again.
+                if std::mem::take(&mut self.meshes_taken_over) {
+                    graphics_context.renderer.set_taken_over_meshes(None);
+                }
             }
             if self.shadows_traced {
                 graphics_context.renderer.set_light_shadow_tracer(None);
