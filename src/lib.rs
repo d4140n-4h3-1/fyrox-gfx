@@ -381,13 +381,29 @@ impl GraphicsEffects {
     }
 }
 
+/// Equal when the same effects are asked for with the same settings, and, once installed, they
+/// are the same installed passes.
 impl PartialEq for GraphicsEffects {
     fn eq(&self, other: &Self) -> bool {
-        match (&self.refraction, &other.refraction) {
+        let same_passes = match (&self.refraction, &other.refraction) {
             (Some(a), Some(b)) => Rc::ptr_eq(a, b),
             (None, None) => true,
             _ => false,
-        }
+        };
+        #[cfg(feature = "raytracing")]
+        let same_tracing =
+            self.yoctite == other.yoctite && self.ray_traced_shadows == other.ray_traced_shadows;
+        #[cfg(not(feature = "raytracing"))]
+        let same_tracing = true;
+        same_passes
+            && same_tracing
+            && self.soft_shadows == other.soft_shadows
+            && self.anti_aliasing == other.anti_aliasing
+            && self.shadow_budget == other.shadow_budget
+            && self.light_budget == other.light_budget
+            && self.ambient_occlusion == other.ambient_occlusion
+            && self.reflections == other.reflections
+            && self.distance_blur == other.distance_blur
     }
 }
 
