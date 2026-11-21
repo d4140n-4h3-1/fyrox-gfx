@@ -86,7 +86,12 @@ use fyrox::{
         Scene,
     },
 };
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use fyrox_graphics_wgpu::{
     raytracing::{
         CutoutMask, RayTracedGeometry, RayTracedInstance, RayTracedScene, ShadowRayLight,
@@ -235,7 +240,7 @@ fn cutout(material: &fyrox::material::Material, masks: &mut Masks) -> Option<u64
     }
     let state = texture.state();
     let texture = state.data_ref()?;
-    let mask = cutout_mask(&texture, alpha as f32 / 255.0).map(Arc::new);
+    let mask = cutout_mask(texture, alpha as f32 / 255.0).map(Arc::new);
     let is_cutout = mask.is_some();
     masks.insert(key, mask);
     is_cutout.then_some(key)
@@ -249,7 +254,7 @@ fn texture_coordinates(surface: &Surface, count: usize) -> Vec<f32> {
         .material()
         .state()
         .data_ref()
-        .and_then(|material| match property(&material, "texCoordScale") {
+        .and_then(|material| match property(material, "texCoordScale") {
             Some(MaterialProperty::Vector2(scale)) => Some(*scale),
             _ => None,
         })
@@ -308,7 +313,7 @@ fn blocks(material: &MaterialResource, masks: &mut Masks) -> Option<Blocks> {
     if opted_out {
         return None;
     }
-    Some(cutout(&material, masks).map_or(Blocks::Solid, Blocks::Cutout))
+    Some(cutout(material, masks).map_or(Blocks::Solid, Blocks::Cutout))
 }
 
 /// How far a mesh may drift, in meters, before it counts as having moved.
@@ -564,6 +569,30 @@ impl From<Blocks> for Traced {
 /// against it too.
 pub(crate) type SharedScene = Rc<RefCell<Option<RayTracedScene>>>;
 
+/// How long what is traced for a scene is kept while another scene is traced: one drawn again
+/// within it carries on where it was, rather than being built again from nothing.
+const KEEP_UNTRACED_SCENE: Duration = Duration::from_secs(10);
+
+/// What is traced for a scene while another one is: its traced scene and everything kept from
+/// frame to frame to build it (see the fields of the same names in [`TracedLightShadows`]).
+#[derive(Default)]
+struct ParkedScene {
+    traced: Option<RayTracedScene>,
+    geometry: FxHashMap<Shape, RayTracedGeometry>,
+    places: Vec<Option<Place>>,
+    frame: u64,
+    placed: Vec<Placed>,
+    was_placed: Vec<Placed>,
+    batches: FxHashMap<BatchKey, Batch>,
+    fixed: Vec<Fixed>,
+    was_fixed: Vec<Fixed>,
+    skins: FxHashMap<u64, Skin>,
+    poses: FxHashMap<Shape, Vec<Matrix4<f32>>>,
+    masks: Masks,
+    /// When it was put aside.
+    since: Option<Instant>,
+}
+
 /// Makes the renderer's shadows by tracing rays. [`crate::GraphicsEffects`] installs it.
 pub struct TracedLightShadows {
     settings: RayTracedShadows,
@@ -573,6 +602,10 @@ pub struct TracedLightShadows {
     switch: crate::Switch,
     /// Which scene it traces.
     scene_handle: Option<Handle<Scene>>,
+    /// What is traced for the other scenes drawn lately, while this one is: the renderer draws
+    /// scenes one after another each frame, and each would otherwise be built again from nothing
+    /// every time its turn came.
+    parked: FxHashMap<Handle<Scene>, ParkedScene>,
     /// Each shape's geometry, built once, and posed geometry refitted every frame.
     geometry: FxHashMap<Shape, RayTracedGeometry>,
     /// Where each mesh was last frame, by the slot its node has in the graph, to tell when one
@@ -617,6 +650,7 @@ impl TracedLightShadows {
             scene,
             switch,
             scene_handle: None,
+            parked: Default::default(),
             geometry: Default::default(),
             places: Default::default(),
             frame: 0,
@@ -630,6 +664,23 @@ impl TracedLightShadows {
             masks: Default::default(),
             unsupported_reported: false,
         }
+    }
+
+    /// Exchanges what is traced now, traced scene and all, for `other`.
+    fn swap_scene(&mut self, other: &mut ParkedScene) {
+        use std::mem::swap;
+        swap(&mut *self.scene.borrow_mut(), &mut other.traced);
+        swap(&mut self.geometry, &mut other.geometry);
+        swap(&mut self.places, &mut other.places);
+        swap(&mut self.frame, &mut other.frame);
+        swap(&mut self.placed, &mut other.placed);
+        swap(&mut self.was_placed, &mut other.was_placed);
+        swap(&mut self.batches, &mut other.batches);
+        swap(&mut self.fixed, &mut other.fixed);
+        swap(&mut self.was_fixed, &mut other.was_fixed);
+        swap(&mut self.skins, &mut other.skins);
+        swap(&mut self.poses, &mut other.poses);
+        swap(&mut self.masks, &mut other.masks);
     }
 }
 
@@ -660,20 +711,27 @@ impl LightShadowTracer for TracedLightShadows {
             if self.scene_handle.take().is_some() {
                 *self.scene.borrow_mut() = None;
             }
+            self.parked.clear();
             return Ok(());
         }
         if self.scene_handle != Some(scene_handle) {
-            *self.scene.borrow_mut() = None;
-            self.geometry.clear();
-            self.places.clear();
-            self.was_placed.clear();
-            self.batches.clear();
-            self.was_fixed.clear();
-            self.skins.clear();
-            self.poses.clear();
-            self.masks.clear();
+            // This scene's own, put aside when another was traced, or nothing yet; and the one
+            // traced until now put aside in its place.
+            let mut other = self.parked.remove(&scene_handle).unwrap_or_default();
+            self.swap_scene(&mut other);
+            match self.scene_handle {
+                Some(was) => {
+                    other.since = Some(Instant::now());
+                    self.parked.insert(was, other);
+                }
+                // Switched off and on again: what was kept from before is built afresh.
+                None => drop(other),
+            }
             self.scene_handle = Some(scene_handle);
         }
+        // Scenes no longer drawn let go of what was traced for them.
+        self.parked
+            .retain(|_, parked| parked.since.is_some_and(|since| since.elapsed() < KEEP_UNTRACED_SCENE));
         let graph = &scene.graph;
         // Where the camera is, to pose only the skinned meshes near enough to tell.
         let camera = graph.linear_iter().find_map(|node| {
