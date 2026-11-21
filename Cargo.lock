@@ -1619,6 +1619,7 @@ version = "0.1.0"
 dependencies = [
  "fyrox",
  "fyrox-graphics-wgpu",
+ "naga",
  "yoctite",
 ]
 

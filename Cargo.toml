@@ -11,7 +11,11 @@ license = "MIT"
 
 [dependencies]
 # On the branch with scene-keyed TakenOverMeshes until it is merged into `vulkan`; then back to `vulkan`.
-# No default features: the game using this crate decides between OpenGL and wgpu (Vulkan).
+# No default features: the game using this crate decides between OpenGL and wgpu (Vulkan). The
+# engine needs exactly one of them, so built on its own the crate needs one named too:
+# `cargo check --features fyrox/backend_wgpu` (or `raytracing`, which turns wgpu on), or
+# `--features fyrox/backend_opengl`. A plain `cargo check` stops in fyrox with "unresolved import
+# `fyrox_impl`"; `cargo test` and the examples pick wgpu through the dev-dependencies below.
 fyrox = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "ccr-248d522f-ryd4xx", default-features = false }
 
 # Ray tracing lives in the wgpu backend, because that is where the device and the acceleration
@@ -26,6 +30,9 @@ raytracing = ["dep:fyrox-graphics-wgpu", "dep:yoctite", "fyrox/backend_wgpu"]
 [dev-dependencies]
 fyrox = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "ccr-248d522f-ryd4xx", default-features = false, features = ["backend_wgpu"] }
 fyrox-graphics-wgpu = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "ccr-248d522f-ryd4xx" }
+# Only to check that the crate's wgpu shaders are valid WGSL (tests/wgsl_shaders.rs), with the
+# naga that wgpu compiles them with.
+naga = { version = "30", features = ["wgsl-in"] }
 
 [[example]]
 name = "glass"

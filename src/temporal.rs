@@ -71,6 +71,10 @@ pub fn jitter(frame: u64) -> Vector2<f32> {
     Vector2::new(halton(index, 2) - 0.5, halton(index, 3) - 0.5)
 }
 
+/// What a frame's history was drawn from: which camera of which scene, its view and projection
+/// without the shift, and where it was.
+type Previous = (Handle<Scene>, Handle<Node>, Matrix4<f32>, Vector3<f32>);
+
 /// The pass. [`crate::GraphicsEffects`] installs it and shifts the view every frame.
 pub struct TemporalPass {
     source_type_id: TypeId,
@@ -85,7 +89,7 @@ pub struct TemporalPass {
     pixel_kind: Option<PixelKind>,
     /// What the history was drawn from: which camera of which scene, its view and projection
     /// without the shift, and where it was.
-    previous: Option<(Handle<Scene>, Handle<Node>, Matrix4<f32>, Vector3<f32>)>,
+    previous: Option<Previous>,
     /// This frame's shift of the view, in pixels, as handed to the renderer.
     jitter: Vector2<f32>,
     moving: MovingThings,
