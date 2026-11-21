@@ -2,7 +2,9 @@
 //! cluster by cluster, at the level of detail each cluster needs from the camera.
 //!
 //! Every surface is built into clusters at every level of detail once (`yoctite::build`), by its
-//! data, so the thousand copies of a tree share one; its vertices and clusters go into the pool
+//! data, so the thousand copies of a tree share one - on threads of its own, so a scene full of
+//! new meshes does not stop the frame while they build; until a mesh's surfaces are built, the
+//! renderer draws it as it would without Yoctite. Its vertices and clusters go into the pool
 //! (`fyrox_graphics_wgpu::yoctite::GeometryPool`), and each mesh node's surfaces are placed in
 //! it as instances, which move with their nodes and go when they do. Each frame, the clusters to
 //! draw are chosen - instances out of the view left out, then for each the cut through its
@@ -62,7 +64,12 @@ use fyrox_graphics_wgpu::{
         PoolVertex, YoctiteMaterial,
     },
 };
-use std::{any::TypeId, collections::hash_map::Entry, sync::Arc, time::Instant};
+use std::{
+    any::TypeId,
+    collections::hash_map::Entry,
+    sync::{mpsc, Arc, Mutex},
+    time::Instant,
+};
 use yoctite::ClusterDag;
 
 /// Lays the cluster view over the frame where it drew anything.
@@ -167,6 +174,130 @@ impl Materials {
     }
 }
 
+/// A surface's geometry, copied out to be built on another thread.
+struct Job {
+    key: u64,
+    positions: Vec<[f32; 3]>,
+    indices: Vec<u32>,
+    uvs: Vec<[f32; 2]>,
+}
+
+/// A surface built: its clusters, how many triangles it had, and how long it took.
+struct Done {
+    key: u64,
+    dag: ClusterDag,
+    triangles: usize,
+    seconds: f64,
+}
+
+/// The most threads surfaces are built on: building is only ever a burst as a scene loads.
+const MAX_BUILDERS: usize = 4;
+
+/// Builds surfaces' clusters on threads of its own, and keeps what it built, by the surface
+/// data's key, for every scene: a surface in two scenes is built once.
+struct Builder {
+    jobs: mpsc::Sender<Job>,
+    done: mpsc::Receiver<Done>,
+    /// Each surface built, or [`None`] while it builds.
+    dags: FxHashMap<u64, Option<Arc<ClusterDag>>>,
+    /// Since it last had nothing to build: how many surfaces it built, of how many triangles,
+    /// how long building them took the threads between them, and when it started.
+    batch: (usize, usize, f64, Option<Instant>),
+    threads: usize,
+}
+
+impl Builder {
+    fn new() -> Self {
+        let (jobs, queue) = mpsc::channel::<Job>();
+        let (finished, done) = mpsc::channel();
+        let queue = Arc::new(Mutex::new(queue));
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get().saturating_sub(1))
+            .clamp(1, MAX_BUILDERS);
+        for n in 0..threads {
+            let queue = queue.clone();
+            let finished = finished.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("yoctite-build-{n}"))
+                .spawn(move || loop {
+                    // Ends when the pass, and the sender with it, is gone.
+                    let Ok(job) = queue.lock().map_err(drop).and_then(|q| q.recv().map_err(drop)) else {
+                        return;
+                    };
+                    let started = Instant::now();
+                    // With its texture coordinates, so a level of detail that drags its texture
+                    // across it counts the drag as error.
+                    let dag = yoctite::build(
+                        &yoctite::Mesh::new(&job.positions, &job.indices).with_texture_coordinates(&job.uvs),
+                        Default::default(),
+                    );
+                    let done = Done {
+                        key: job.key,
+                        dag,
+                        triangles: job.indices.len() / 3,
+                        seconds: started.elapsed().as_secs_f64(),
+                    };
+                    if finished.send(done).is_err() {
+                        return;
+                    }
+                });
+            if let Err(err) = spawned {
+                Log::err(format!("Yoctite could not start a thread to build on: {err}"));
+            }
+        }
+        Self {
+            jobs,
+            done,
+            dags: Default::default(),
+            batch: (0, 0, 0.0, None),
+            threads,
+        }
+    }
+
+    /// Takes in what the threads have built since last time.
+    fn collect(&mut self) {
+        while let Ok(done) = self.done.try_recv() {
+            self.dags.insert(done.key, Some(Arc::new(done.dag)));
+            self.batch.0 += 1;
+            self.batch.1 += done.triangles;
+            self.batch.2 += done.seconds;
+        }
+        if let (count @ 1.., triangles, seconds, Some(started)) = self.batch {
+            if self.dags.values().all(Option::is_some) {
+                Log::info(format!(
+                    "Yoctite: built {count} surfaces ({triangles} triangles) in {:.2} s, {seconds:.2} s of building \
+                     on {} threads",
+                    started.elapsed().as_secs_f64(),
+                    self.threads
+                ));
+                self.batch = (0, 0, 0.0, None);
+            }
+        }
+    }
+
+    /// `surface`'s clusters, if they are built; if not, set building.
+    fn dag(&mut self, surface: &Surface) -> Option<Arc<ClusterDag>> {
+        let key = surface.data().key();
+        match self.dags.entry(key) {
+            Entry::Occupied(built) => built.get().clone(),
+            Entry::Vacant(place) => {
+                let (vertices, indices) = read_surface(surface);
+                let job = Job {
+                    key,
+                    positions: vertices.iter().map(|v| v.position).collect(),
+                    uvs: vertices.iter().map(|v| v.uv).collect(),
+                    indices,
+                };
+                if self.jobs.send(job).is_ok() {
+                    place.insert(None);
+                    self.batch.3.get_or_insert_with(Instant::now);
+                }
+                None
+            }
+        }
+    }
+}
+
 /// One scene's meshes in Yoctite: a pool, and the choice of what to draw from it, of its own.
 /// Node handles are only told apart within a scene, and what one scene's camera draws is only
 /// that scene's.
@@ -193,9 +324,8 @@ pub struct YoctitePass {
     taken_over: Option<TakenOverMeshes>,
     drawer: Option<GBufferDrawer>,
     shader: Option<RenderPassContainer>,
-    /// Every surface built, by its data's key, shared by the scenes: a surface in two scenes is
-    /// built once.
-    dags: FxHashMap<u64, Arc<ClusterDag>>,
+    /// Builds every surface, once for all the scenes; made at the first frame.
+    builder: Option<Builder>,
     scenes: FxHashMap<Handle<Scene>, SceneMeshes>,
     failed: bool,
 }
@@ -210,7 +340,7 @@ impl YoctitePass {
             taken_over,
             drawer: None,
             shader: None,
-            dags: Default::default(),
+            builder: None,
             scenes: Default::default(),
             failed: false,
         }
@@ -423,17 +553,17 @@ fn view_projection_of(observer: &Observer) -> [[f32; 4]; 4] {
 }
 
 impl SceneMeshes {
-    /// Keeps the pool in step with the scene's meshes: new surfaces built and uploaded, new
-    /// mesh nodes placed, moved ones moved, gone ones taken out. Drawing in place of the renderer,
-    /// only meshes whose materials it can draw are placed, and each with its material's slot.
-    /// Returns the mesh nodes placed.
-    /// Surfaces are built once for every scene, through `dags`.
+    /// Keeps the pool in step with the scene's meshes: new surfaces uploaded once built, new
+    /// mesh nodes placed once all their surfaces are, moved ones moved, gone ones taken out.
+    /// Drawing in place of the renderer, only meshes whose materials it can draw are placed, and
+    /// each with its material's slot. Returns the mesh nodes placed: those still building are
+    /// left to the renderer. Surfaces are built by `builder`, once for every scene.
     fn sync(
         &mut self,
         server: &WgpuGraphicsServer,
         graph: &Graph,
         mode: Mode,
-        dags: &mut FxHashMap<u64, Arc<ClusterDag>>,
+        builder: &mut Builder,
     ) -> FxHashSet<Handle<Node>> {
         let device = &server.state.device;
         let queue = &server.state.queue;
@@ -441,7 +571,7 @@ impl SceneMeshes {
         let pool = self.pool.get_or_insert_with(|| GeometryPool::new(device, 1 << 16));
         self.frame += 1;
         let frame = self.frame;
-        let mut newly_built = (0, 0usize, 0.0f64);
+        let mut uploaded = 0;
         let mut nodes = FxHashSet::default();
         for (handle, node) in graph.pair_iter() {
             let Some(mesh) = node.cast::<Mesh>() else {
@@ -464,32 +594,23 @@ impl SceneMeshes {
             let Some(shadings) = shadings else {
                 continue;
             };
+            // Every surface's clusters, or the mesh stays the renderer's while they build.
+            let dags: Vec<Option<Arc<ClusterDag>>> = mesh.surfaces().iter().map(|s| builder.dag(s)).collect();
+            let Some(dags) = dags.into_iter().collect::<Option<Vec<_>>>() else {
+                continue;
+            };
             nodes.insert(handle);
             let transform = node.global_transform();
-            for ((n, surface), shading) in mesh.surfaces().iter().enumerate().zip(shadings) {
+            for (((n, surface), shading), dag) in mesh.surfaces().iter().enumerate().zip(shadings).zip(dags) {
                 let data = surface.data().key();
                 let mesh = match self.built.entry(data) {
                     Entry::Occupied(built) => built.get().mesh,
                     Entry::Vacant(place) => {
-                        let (vertices, indices) = read_surface(surface);
-                        let dag = dags
-                            .entry(data)
-                            .or_insert_with(|| {
-                                let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
-                                // With its texture coordinates, so a level of detail that drags
-                                // its texture across it counts the drag as error.
-                                let uvs: Vec<[f32; 2]> = vertices.iter().map(|v| v.uv).collect();
-                                let started = Instant::now();
-                                let dag = yoctite::build(
-                                    &yoctite::Mesh::new(&positions, &indices).with_texture_coordinates(&uvs),
-                                    Default::default(),
-                                );
-                                newly_built.0 += 1;
-                                newly_built.1 += indices.len() / 3;
-                                newly_built.2 += started.elapsed().as_secs_f64();
-                                Arc::new(dag)
-                            })
-                            .clone();
+                        let (mut vertices, _) = read_surface(surface);
+                        // With the vertices its coarser levels made: grown foliage cards'
+                        // corners.
+                        dag.extend_vertices(&mut vertices, |v, at| v.position = at);
+                        uploaded += 1;
                         let mesh = pool.add_mesh(device, queue, &dag, &vertices);
                         place.insert(Built { mesh, dag }).mesh
                     }
@@ -537,14 +658,10 @@ impl SceneMeshes {
             }
             keep
         });
-        if newly_built.0 > 0 {
+        if uploaded > 0 {
             let stats = pool.stats();
             Log::info(format!(
-                "Yoctite: built {} surfaces ({} triangles) in {:.2} s; the pool holds {} meshes, {} instances, \
-                 {} clusters, {:.1} MB",
-                newly_built.0,
-                newly_built.1,
-                newly_built.2,
+                "Yoctite: {uploaded} surfaces uploaded; the pool holds {} meshes, {} instances, {} clusters, {:.1} MB",
                 stats.meshes,
                 stats.instances,
                 stats.clusters,
@@ -623,8 +740,10 @@ impl SceneRenderPass for YoctitePass {
             return Ok(Default::default());
         };
         let started = Instant::now();
+        let builder = self.builder.get_or_insert_with(Builder::new);
+        builder.collect();
         let scene = self.scenes.entry(ctx.scene_handle).or_default();
-        let nodes = scene.sync(server, &ctx.scene.graph, self.mode, &mut self.dags);
+        let nodes = scene.sync(server, &ctx.scene.graph, self.mode, builder);
         // From the next frame on the renderer leaves these out: this one, it drew them already,
         // which drawing them again changes nothing of.
         if let Some(taken_over) = &self.taken_over {
@@ -695,8 +814,10 @@ impl SceneRenderPass for YoctitePass {
             self.shader = Some(RenderPassContainer::new(ctx.server, &shader)?);
         }
         let started = Instant::now();
+        let builder = self.builder.get_or_insert_with(Builder::new);
+        builder.collect();
         let scene = self.scenes.entry(ctx.scene_handle).or_default();
-        scene.sync(server, &ctx.scene.graph, self.mode, &mut self.dags);
+        scene.sync(server, &ctx.scene.graph, self.mode, builder);
         let synced = started.elapsed().as_secs_f64();
 
         let position = &ctx.observer.position;
