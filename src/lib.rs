@@ -420,6 +420,7 @@ impl Plugin for GraphicsEffects {
                             shadows,
                             traced_scene,
                             self.shadow_switch.clone(),
+                            temporal,
                         ),
                     )));
                 }

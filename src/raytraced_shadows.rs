@@ -103,7 +103,9 @@ pub struct RayTracedShadows {
     pub reach: f32,
     /// How far off a surface a ray starts, in meters, so it does not shadow itself.
     pub bias: f32,
-    /// Rays per pixel. One gives hard shadows; more give soft edges, at the cost of more rays.
+    /// Rays per pixel, spread over the light's size: soft edges for a light with a size, smoother
+    /// the more rays, each costing as much again. With temporal anti-aliasing one is enough: the
+    /// rays turn over the light from frame to frame, and the frames are averaged.
     pub samples: u32,
     /// The radius of the glowing part of a point light, in meters. Bigger is softer.
     pub point_light_size: f32,
@@ -119,7 +121,7 @@ impl Default for RayTracedShadows {
         Self {
             reach: 200.0,
             bias: 0.02,
-            samples: 4,
+            samples: 1,
             point_light_size: 0.15,
             spot_light_size: 0.03,
             sun_angular_radius: 1.0,
@@ -128,10 +130,13 @@ impl Default for RayTracedShadows {
 }
 
 impl RayTracedShadows {
-    /// One ray per pixel: sharp shadows, and the cheapest.
+    /// Sharp shadows: lights with no size, one ray per pixel, and no blur.
     pub fn hard() -> Self {
         Self {
             samples: 1,
+            point_light_size: 0.0,
+            spot_light_size: 0.0,
+            sun_angular_radius: 0.0,
             ..Default::default()
         }
     }
@@ -438,14 +443,34 @@ fn positions(graph: &Graph, surface: &Surface) -> Vec<f32> {
     out
 }
 
-/// `surface`'s triangles, as indices into the first `count` of its vertices: only whole ones.
+/// `surface`'s triangles, as indices into the first `count` of its vertices: only whole ones,
+/// and each place only once. A sheet made double-sided by a reversed copy of each triangle -
+/// foliage cards, for a renderer that culls faces seen from behind - has every triangle twice,
+/// and a ray, which hits a triangle from either side, would test each twice: for cutouts, the
+/// most of what a shadow ray costs. For glass, the twin would let through its share of the light
+/// a second time.
 fn triangles(surface: &Surface, count: usize) -> Vec<u32> {
     let data = surface.data();
     let data = data.data_ref();
     let count = count as u32;
+    let positions: Vec<[u32; 3]> = data
+        .vertex_buffer
+        .iter()
+        .map(|v| {
+            v.read_3_f32(VertexAttributeUsage::Position)
+                .map_or([0; 3], |p| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()])
+        })
+        .collect();
+    let mut seen = FxHashSet::default();
     data.geometry_buffer
         .iter()
         .filter(|triangle| triangle.0.iter().all(|&i| i < count))
+        .filter(|triangle| {
+            // The same three places whichever way round, and from whichever corner.
+            let mut corners = triangle.0.map(|i| positions.get(i as usize).copied().unwrap_or_default());
+            corners.sort_unstable();
+            seen.insert(corners)
+        })
         .flat_map(|triangle| triangle.0)
         .collect()
 }
@@ -567,6 +592,9 @@ pub(crate) type SharedScene = Rc<RefCell<Option<RayTracedScene>>>;
 /// Makes the renderer's shadows by tracing rays. [`crate::GraphicsEffects`] installs it.
 pub struct TracedLightShadows {
     settings: RayTracedShadows,
+    /// Whether the frames are averaged after (temporal anti-aliasing), so the rays can turn over
+    /// the light from frame to frame.
+    turn_over_frames: bool,
     tracer: Option<ShadowTracer>,
     scene: SharedScene,
     /// Whether to trace at all.
@@ -610,9 +638,15 @@ impl std::fmt::Debug for TracedLightShadows {
 }
 
 impl TracedLightShadows {
-    pub(crate) fn new(settings: RayTracedShadows, scene: SharedScene, switch: crate::Switch) -> Self {
+    pub(crate) fn new(
+        settings: RayTracedShadows,
+        scene: SharedScene,
+        switch: crate::Switch,
+        turn_over_frames: bool,
+    ) -> Self {
         Self {
             settings,
+            turn_over_frames,
             tracer: None,
             scene,
             switch,
@@ -1016,6 +1050,7 @@ impl LightShadowTracer for TracedLightShadows {
                 flip_v: true,
                 scissor,
                 samples: self.settings.samples,
+                frame: self.turn_over_frames.then_some(self.frame as u32),
             },
         )
     }
@@ -1061,6 +1096,38 @@ mod tests {
         let faint = texture(4, |_, _| 153);
         assert!(cutout_mask(&faint, 1.0).is_none());
         assert!(cutout_mask(&faint, 0.5).is_some());
+    }
+
+    #[test]
+    fn a_sheet_made_double_sided_is_traced_once() {
+        use fyrox::{
+            core::{algebra::Matrix4, math::TriangleDefinition},
+            scene::mesh::surface::{SurfaceData, SurfaceResource},
+        };
+        // A quad, and a reversed copy of each of its triangles, on the same vertices - and on
+        // copies of them, as a game doubling foliage makes them.
+        let mut data = SurfaceData::make_quad(&Matrix4::identity());
+        let count = data.vertex_buffer.vertex_count();
+        let raw = data.vertex_buffer.raw_data().to_vec();
+        let size = data.vertex_buffer.vertex_size() as usize;
+        {
+            let mut vertices = data.vertex_buffer.modify();
+            for vertex in raw.chunks_exact(size) {
+                let _ = vertices.push_vertex_raw(vertex);
+            }
+        }
+        let front: Vec<[u32; 3]> = data.geometry_buffer.iter().map(|t| t.0).collect();
+        {
+            let mut triangles = data.geometry_buffer.modify();
+            for t in &front {
+                triangles.push(TriangleDefinition([t[0], t[2], t[1]]));
+                triangles.push(TriangleDefinition([t[0] + count, t[2] + count, t[1] + count]));
+            }
+        }
+        let surface = Surface::new(SurfaceResource::new_embedded(data));
+        let traced = triangles(&surface, 2 * count as usize);
+        assert_eq!(traced.len(), front.len() * 3, "each place once");
+        assert_eq!(&traced[..], front.iter().flatten().copied().collect::<Vec<_>>().as_slice(), "the first of each kept");
     }
 
     #[test]
