@@ -171,6 +171,14 @@ impl Materials {
 /// or gone, lets its GPU memory go, and is placed again if it is drawn again.
 const KEEP_UNDRAWN_SCENE: Duration = Duration::from_secs(10);
 
+/// How many times a scene's pool is brought in step with it while a mesh in it has no surface
+/// placed, before the mesh is taken out: not at once, so that one coming and going - a level of
+/// detail shown and hidden - is not uploaded again each time.
+const KEEP_UNUSED_MESH: u64 = 600;
+
+/// How often, in passes drawn, built clusters no scene's pool holds are let go.
+const FORGET_DAGS_EVERY: u64 = 300;
+
 /// Yoctite in the renderer: see the module's description. [`crate::GraphicsEffects::with_yoctite`]
 /// and [`crate::GraphicsEffects::with_yoctite_view`] add it.
 pub struct YoctitePass {
@@ -186,6 +194,8 @@ pub struct YoctitePass {
     /// What is kept for each scene drawn: node handles are only unique within their scene, and
     /// the GPU draws everything in a pool, so each scene has a pool of its own.
     scenes: FxHashMap<Handle<Scene>, ScenePool>,
+    /// Passes drawn, to let go of built clusters now and then.
+    passes: u64,
     failed: bool,
 }
 
@@ -205,8 +215,9 @@ impl std::fmt::Debug for YoctitePass {
 struct ScenePool {
     pool: GeometryPool,
     culler: Option<Culler>,
-    /// Each surface's mesh in this pool, by the surface's data.
-    meshes: FxHashMap<u64, MeshId>,
+    /// Each surface's mesh in this pool, by the surface's data, and the last time a surface of it
+    /// was placed (see `frame`).
+    meshes: FxHashMap<u64, (MeshId, u64)>,
     placed: FxHashMap<(Handle<Node>, usize), Placed>,
     materials: Materials,
     /// How many times it has been brought in step with its scene.
@@ -244,6 +255,7 @@ impl YoctitePass {
             shader: None,
             dags: Default::default(),
             scenes: Default::default(),
+            passes: 0,
             failed: false,
         }
     }
@@ -262,6 +274,13 @@ impl YoctitePass {
             }
             keep
         });
+        // Clusters built for surfaces no pool holds any more: their meshes are gone from the scenes.
+        self.passes += 1;
+        if self.passes.is_multiple_of(FORGET_DAGS_EVERY) {
+            let scenes = &self.scenes;
+            self.dags
+                .retain(|data, _| scenes.values().any(|pool| pool.meshes.contains_key(data)));
+        }
         let pool = self.scenes.entry(scene).or_insert_with(|| ScenePool::new(server));
         pool.drawn = now;
         pool
@@ -577,7 +596,10 @@ fn sync(
         for ((n, surface), shading) in mesh.surfaces().iter().enumerate().zip(shadings) {
             let data = surface.data().key();
             let mesh = match meshes.entry(data) {
-                Entry::Occupied(mesh) => *mesh.get(),
+                Entry::Occupied(mut mesh) => {
+                    mesh.get_mut().1 = frame;
+                    mesh.get().0
+                }
                 Entry::Vacant(place) => {
                     let (vertices, indices) = read_surface(surface);
                     let dag = match dags.entry(data) {
@@ -598,7 +620,7 @@ fn sync(
                             place.insert(Arc::new(dag)).clone()
                         }
                     };
-                    *place.insert(pool.add_mesh(device, queue, &dag, &vertices))
+                    place.insert((pool.add_mesh(device, queue, &dag, &vertices), frame)).0
                 }
             };
             let material = if rendering { surface.material().key() } else { 0 };
@@ -640,6 +662,14 @@ fn sync(
             if rendering {
                 materials.give_back(placed.material);
             }
+        }
+        keep
+    });
+    // Meshes no surface has been placed with for a while: none of their instances is left.
+    meshes.retain(|_, &mut (mesh, used)| {
+        let keep = frame - used < KEEP_UNUSED_MESH;
+        if !keep {
+            pool.remove_mesh(queue, mesh);
         }
         keep
     });
@@ -691,7 +721,7 @@ fn choose(
     let mut list = Vec::new();
     let mut triangles = 0;
     for placed in scene.placed.values() {
-        let (Some(dag), Some(&mesh)) = (dags.get(&placed.data), scene.meshes.get(&placed.data)) else {
+        let (Some(dag), Some(&(mesh, _))) = (dags.get(&placed.data), scene.meshes.get(&placed.data)) else {
             continue;
         };
         let Some(mesh) = scene.pool.mesh(mesh) else {
