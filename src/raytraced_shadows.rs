@@ -114,6 +114,10 @@ pub struct RayTracedShadows {
     /// How big the sun looks, in degrees from its middle to its edge. The real one is about a
     /// quarter of a degree; a little more reads better at a game's scale.
     pub sun_angular_radius: f32,
+    /// Whether to trace one pixel of each 2x2 block, a quarter of the rays, filling in the rest
+    /// from the traced pixels on the same surface. With temporal anti-aliasing a different pixel
+    /// is traced each frame and the frames are averaged, so a still view comes to full detail.
+    pub half_resolution: bool,
 }
 
 impl Default for RayTracedShadows {
@@ -125,6 +129,7 @@ impl Default for RayTracedShadows {
             point_light_size: 0.15,
             spot_light_size: 0.03,
             sun_angular_radius: 1.0,
+            half_resolution: true,
         }
     }
 }
@@ -1051,6 +1056,7 @@ impl LightShadowTracer for TracedLightShadows {
                 scissor,
                 samples: self.settings.samples,
                 frame: self.turn_over_frames.then_some(self.frame as u32),
+                half_resolution: self.settings.half_resolution,
             },
         )
     }
