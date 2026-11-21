@@ -853,11 +853,15 @@ impl SceneRenderPass for YoctitePass {
         let drew = started.elapsed().as_secs_f64();
         let (clusters, triangles) = scene.chosen("").unwrap_or_default();
         if scene.frame % STATS_EVERY == 1 {
+            let hidden = scene.culler.as_ref().and_then(Culler::stats).unwrap_or_default();
             Log::info(format!(
-                "Yoctite: {clusters} clusters, {triangles} triangles in {} draws ({} materials); the CPU took {:.2} ms \
-                 keeping up with the scene and its materials and {:.2} ms choosing and drawing",
+                "Yoctite: {clusters} clusters, {triangles} triangles in {} draws ({} materials), of them {} clusters \
+                 and {} triangles hidden by the frame before; the CPU took {:.2} ms keeping up with the scene and its \
+                 materials and {:.2} ms choosing and drawing",
                 draws.draw_calls,
                 materials.len(),
+                hidden.hidden_clusters,
+                hidden.hidden_triangles,
                 synced * 1000.0,
                 drew * 1000.0
             ));
