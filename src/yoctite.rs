@@ -100,10 +100,21 @@ struct Built {
 /// A mesh node's surface placed in the pool.
 struct Placed {
     instance: InstanceId,
-    /// Its surface's data, to tell when it is given other data.
+    /// Its surface's data, by key.
     data: u64,
-    /// Its material, by key, and the slot it is drawn with.
+    /// Its material, by key, whose slot it is drawn with.
     material: u64,
+}
+
+/// A mesh node Yoctite draws, or will once its surfaces are built: what was found of it, and
+/// where it was placed. Unchanged, a node costs a look at its keys and its transform each frame:
+/// finding out what it is locks every surface's data and every material.
+struct Drawn {
+    /// Its surfaces' data and materials, by key, and how each is shaded.
+    keys: Vec<(u64, u64)>,
+    shadings: Vec<Shading>,
+    /// Its surfaces placed in the pool, in order: none until all of them are built.
+    placed: Vec<Placed>,
     /// Where it was placed, to tell when it moves.
     transform: Matrix4<f32>,
     /// The last frame it was seen in, to take out what has gone.
@@ -275,6 +286,13 @@ impl Builder {
         }
     }
 
+    /// Lets go of what was built for surfaces none of `scenes` has in its pool any more; those
+    /// still building are kept.
+    fn forget_unused<'a>(&mut self, scenes: impl Iterator<Item = &'a SceneMeshes>) {
+        let used: FxHashSet<u64> = scenes.flat_map(|scene| scene.built.keys().copied()).collect();
+        self.dags.retain(|key, dag| dag.is_none() || used.contains(key));
+    }
+
     /// `surface`'s clusters, if they are built; if not, set building.
     fn dag(&mut self, surface: &Surface) -> Option<Arc<ClusterDag>> {
         let key = surface.data().key();
@@ -308,7 +326,10 @@ struct SceneMeshes {
     view: Option<ClusterView>,
     /// The surfaces in the pool, by their data's key.
     built: FxHashMap<u64, Built>,
-    placed: FxHashMap<(Handle<Node>, usize), Placed>,
+    /// Each mesh node it draws, or will.
+    nodes: FxHashMap<Handle<Node>, Drawn>,
+    /// The mesh nodes placed, which the renderer leaves out of its own draw.
+    taken_over: FxHashSet<Handle<Node>>,
     materials: Materials,
     /// How many times the scene has been drawn.
     frame: u64,
@@ -556,56 +577,109 @@ impl SceneMeshes {
     /// Keeps the pool in step with the scene's meshes: new surfaces uploaded once built, new
     /// mesh nodes placed once all their surfaces are, moved ones moved, gone ones taken out.
     /// Drawing in place of the renderer, only meshes whose materials it can draw are placed, and
-    /// each with its material's slot. Returns the mesh nodes placed: those still building are
-    /// left to the renderer. Surfaces are built by `builder`, once for every scene.
-    fn sync(
-        &mut self,
-        server: &WgpuGraphicsServer,
-        graph: &Graph,
-        mode: Mode,
-        builder: &mut Builder,
-    ) -> FxHashSet<Handle<Node>> {
+    /// each with its material's slot; those still building are left to the renderer. Surfaces are
+    /// built by `builder`, once for every scene. Whether the mesh nodes placed
+    /// ([`Self::taken_over`]) changed.
+    fn sync(&mut self, server: &WgpuGraphicsServer, graph: &Graph, mode: Mode, builder: &mut Builder) -> bool {
         let device = &server.state.device;
         let queue = &server.state.queue;
         let rendering = mode == Mode::Render;
-        let pool = self.pool.get_or_insert_with(|| GeometryPool::new(device, 1 << 16));
-        self.frame += 1;
-        let frame = self.frame;
+        let Self {
+            pool,
+            built,
+            nodes,
+            taken_over,
+            materials,
+            frame,
+            ..
+        } = self;
+        let pool = pool.get_or_insert_with(|| GeometryPool::new(device, 1 << 16));
+        *frame += 1;
+        let frame = *frame;
+        // Gives a node's surfaces' room in the pool, and their materials' slots, back.
+        let release = |pool: &mut GeometryPool, materials: &mut Materials, drawn: &Drawn| {
+            for placed in &drawn.placed {
+                pool.remove_instance(queue, placed.instance);
+                if rendering {
+                    materials.give_back(placed.material);
+                }
+            }
+        };
         let mut uploaded = 0;
-        let mut nodes = FxHashSet::default();
+        let mut changed = false;
         for (handle, node) in graph.pair_iter() {
             let Some(mesh) = node.cast::<Mesh>() else {
                 continue;
             };
-            // Skinned meshes, those with blend shapes and those drawn forward stay the renderer's.
-            if !node.global_visibility()
-                || mesh.render_path() != RenderPath::Deferred
-                || mesh.surfaces().iter().any(|s| {
-                    !s.bones().is_empty() || s.data().data_ref().blend_shapes_container.is_some()
-                })
-            {
+            // Those hidden and those drawn forward stay the renderer's.
+            if !node.global_visibility() || mesh.render_path() != RenderPath::Deferred {
                 continue;
             }
-            let shadings: Option<Vec<Shading>> = if rendering {
-                mesh.surfaces().iter().map(|s| shading(s.material())).collect()
-            } else {
-                Some(vec![Shading::Standard; mesh.surfaces().len()])
+            let surfaces = mesh.surfaces();
+            let same = |drawn: &Drawn| {
+                drawn.keys.len() == surfaces.len()
+                    && drawn.keys.iter().zip(surfaces).all(|(k, s)| *k == (s.data().key(), s.material().key()))
             };
-            let Some(shadings) = shadings else {
-                continue;
-            };
-            // Every surface's clusters, or the mesh stays the renderer's while they build.
-            let dags: Vec<Option<Arc<ClusterDag>>> = mesh.surfaces().iter().map(|s| builder.dag(s)).collect();
-            let Some(dags) = dags.into_iter().collect::<Option<Vec<_>>>() else {
-                continue;
-            };
-            nodes.insert(handle);
+            if !nodes.get(&handle).is_some_and(same) {
+                // New, or given other surfaces or materials: what was placed of it goes.
+                if let Some(old) = nodes.remove(&handle) {
+                    release(pool, materials, &old);
+                    changed |= taken_over.remove(&handle);
+                }
+                // Skinned meshes and those with blend shapes stay the renderer's, and so do
+                // those with a material Yoctite cannot draw as the engine does - or not yet: one
+                // still loading is looked into again next frame.
+                let shadings: Option<Vec<Shading>> = if surfaces.iter().any(|s| {
+                    !s.bones().is_empty() || s.data().data_ref().blend_shapes_container.is_some()
+                }) {
+                    None
+                } else if rendering {
+                    surfaces.iter().map(|s| shading(s.material())).collect()
+                } else {
+                    Some(vec![Shading::Standard; surfaces.len()])
+                };
+                let Some(shadings) = shadings else {
+                    continue;
+                };
+                nodes.insert(
+                    handle,
+                    Drawn {
+                        keys: surfaces.iter().map(|s| (s.data().key(), s.material().key())).collect(),
+                        shadings,
+                        placed: Vec::new(),
+                        transform: Matrix4::identity(),
+                        seen: frame,
+                    },
+                );
+            }
+            let drawn = nodes.get_mut(&handle).expect("found or made above");
+            drawn.seen = frame;
             let transform = node.global_transform();
-            for (((n, surface), shading), dag) in mesh.surfaces().iter().enumerate().zip(shadings).zip(dags) {
+            if !drawn.placed.is_empty() {
+                if drawn.transform != transform {
+                    for placed in &drawn.placed {
+                        pool.move_instance(queue, placed.instance, rows(&transform));
+                    }
+                    drawn.transform = transform;
+                }
+                continue;
+            }
+
+            // Placed once every surface is built; each asked for, so all of a mesh's build at
+            // once.
+            let mut ready = true;
+            for surface in surfaces {
+                ready &= built.contains_key(&surface.data().key()) || builder.dag(surface).is_some();
+            }
+            if !ready {
+                continue;
+            }
+            for (n, surface) in surfaces.iter().enumerate() {
                 let data = surface.data().key();
-                let mesh = match self.built.entry(data) {
+                let mesh = match built.entry(data) {
                     Entry::Occupied(built) => built.get().mesh,
                     Entry::Vacant(place) => {
+                        let dag = builder.dag(surface).expect("built, as checked above");
                         let (mut vertices, _) = read_surface(surface);
                         // With the vertices its coarser levels made: grown foliage cards'
                         // corners.
@@ -615,49 +689,40 @@ impl SceneMeshes {
                         place.insert(Built { mesh, dag }).mesh
                     }
                 };
-                let material = if rendering { surface.material().key() } else { 0 };
-                match self.placed.get_mut(&(handle, n)) {
-                    Some(placed) if placed.data == data && placed.material == material => {
-                        if placed.transform != transform {
-                            pool.move_instance(queue, placed.instance, rows(&transform));
-                            placed.transform = transform;
-                        }
-                        placed.seen = frame;
-                    }
-                    other => {
-                        if let Some(old) = other {
-                            pool.remove_instance(queue, old.instance);
-                            if rendering {
-                                self.materials.give_back(old.material);
-                            }
-                        }
-                        let slot = if rendering { self.materials.take(surface.material(), shading) } else { 0 };
-                        let instance = pool.add_instance(device, queue, mesh, rows(&transform), slot);
-                        self.placed.insert(
-                            (handle, n),
-                            Placed {
-                                instance,
-                                data,
-                                material,
-                                transform,
-                                seen: frame,
-                            },
-                        );
-                    }
-                }
+                let (material, slot) = if rendering {
+                    (surface.material().key(), materials.take(surface.material(), drawn.shadings[n]))
+                } else {
+                    (0, 0)
+                };
+                let instance = pool.add_instance(device, queue, mesh, rows(&transform), slot);
+                drawn.placed.push(Placed { instance, data, material });
             }
+            drawn.transform = transform;
+            changed |= taken_over.insert(handle);
         }
-        let materials = &mut self.materials;
-        self.placed.retain(|_, placed| {
-            let keep = placed.seen == frame;
+
+        // Nodes gone, hidden or no longer drawable: theirs goes too.
+        let mut removed = false;
+        nodes.retain(|handle, drawn| {
+            let keep = drawn.seen == frame;
             if !keep {
-                pool.remove_instance(queue, placed.instance);
-                if rendering {
-                    materials.give_back(placed.material);
-                }
+                release(pool, materials, drawn);
+                changed |= taken_over.remove(handle);
+                removed = true;
             }
             keep
         });
+        if removed {
+            // Meshes nothing is placed from any more go, giving back their room in the pool.
+            let used: FxHashSet<u64> = nodes.values().flat_map(|d| d.placed.iter().map(|p| p.data)).collect();
+            built.retain(|data, built| {
+                let keep = used.contains(data);
+                if !keep {
+                    pool.remove_mesh(queue, built.mesh);
+                }
+                keep
+            });
+        }
         if uploaded > 0 {
             let stats = pool.stats();
             Log::info(format!(
@@ -668,7 +733,7 @@ impl SceneMeshes {
                 stats.bytes as f64 / 1048576.0
             ));
         }
-        nodes
+        changed
     }
 
     /// What the GPU chose, read back a frame or two late, as clusters and triangles; warning once
@@ -693,7 +758,7 @@ impl SceneMeshes {
 /// clusters, and how many triangles they come to: the reference for the GPU's choice.
 fn choose(
     built: &FxHashMap<u64, Built>,
-    placed: &FxHashMap<(Handle<Node>, usize), Placed>,
+    nodes: &FxHashMap<Handle<Node>, Drawn>,
     pool: &GeometryPool,
     view_projection: &Matrix4<f32>,
     eye: Vector3<f32>,
@@ -702,7 +767,7 @@ fn choose(
     let mut list = Vec::new();
     let mut triangles = 0;
     let by_mesh: FxHashMap<MeshId, &Built> = built.values().map(|b| (b.mesh, b)).collect();
-    for placed in placed.values() {
+    for (drawn, placed) in nodes.values().flat_map(|d| d.placed.iter().map(move |p| (d, p))) {
         let Some(record) = pool.instance(placed.instance) else {
             continue;
         };
@@ -712,7 +777,7 @@ fn choose(
         let Some(mesh) = pool.mesh(built.mesh) else {
             continue;
         };
-        let t = &placed.transform;
+        let t = &drawn.transform;
         let scale = (0..3).map(|c| t.column(c).xyz().norm()).fold(0.0, f32::max);
         let center = t.transform_point(&Point3::new(mesh.bounds[0], mesh.bounds[1], mesh.bounds[2]));
         if !in_view(view_projection, center.coords, mesh.bounds[3] * scale) {
@@ -743,12 +808,17 @@ impl SceneRenderPass for YoctitePass {
         let builder = self.builder.get_or_insert_with(Builder::new);
         builder.collect();
         let scene = self.scenes.entry(ctx.scene_handle).or_default();
-        let nodes = scene.sync(server, &ctx.scene.graph, self.mode, builder);
+        let meshes = scene.built.len();
+        let changed = scene.sync(server, &ctx.scene.graph, self.mode, builder);
         // From the next frame on the renderer leaves these out: this one, it drew them already,
         // which drawing them again changes nothing of.
-        if let Some(taken_over) = &self.taken_over {
-            taken_over.borrow_mut().insert(ctx.scene_handle, nodes);
+        if let (true, Some(taken_over)) = (changed, &self.taken_over) {
+            taken_over.borrow_mut().insert(ctx.scene_handle, scene.taken_over.clone());
         }
+        if scene.built.len() < meshes {
+            builder.forget_unused(self.scenes.values());
+        }
+        let scene = self.scenes.get_mut(&ctx.scene_handle).expect("synced above");
         let materials: Vec<YoctiteMaterial> = scene
             .materials
             .by_key
@@ -817,7 +887,12 @@ impl SceneRenderPass for YoctitePass {
         let builder = self.builder.get_or_insert_with(Builder::new);
         builder.collect();
         let scene = self.scenes.entry(ctx.scene_handle).or_default();
+        let meshes = scene.built.len();
         scene.sync(server, &ctx.scene.graph, self.mode, builder);
+        if scene.built.len() < meshes {
+            builder.forget_unused(self.scenes.values());
+        }
+        let scene = self.scenes.get_mut(&ctx.scene_handle).expect("synced above");
         let synced = started.elapsed().as_secs_f64();
 
         let position = &ctx.observer.position;
@@ -834,7 +909,7 @@ impl SceneRenderPass for YoctitePass {
             let drawn = view.draw_culled(server, pool, culler, view_projection, eye.into(), threshold, width, height);
             (drawn, None)
         } else {
-            let (list, triangles) = choose(&scene.built, &scene.placed, pool, &position.view_projection_matrix, eye, threshold);
+            let (list, triangles) = choose(&scene.built, &scene.nodes, pool, &position.view_projection_matrix, eye, threshold);
             let drawn = view.draw(server, pool, view_projection, width, height, &list);
             (drawn, Some((list.len(), triangles)))
         };
