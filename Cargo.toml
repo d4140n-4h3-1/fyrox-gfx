@@ -10,21 +10,22 @@ license = "MIT"
 [workspace]
 
 [dependencies]
+# On the branch with scene-keyed TakenOverMeshes until it is merged into `vulkan`; then back to `vulkan`.
 # No default features: the game using this crate decides between OpenGL and wgpu (Vulkan).
-fyrox = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "vulkan", default-features = false }
+fyrox = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "ccr-248d522f-ryd4xx", default-features = false }
 
 # Ray tracing lives in the wgpu backend, because that is where the device and the acceleration
 # structures are. Games on OpenGL simply do not enable this feature.
-fyrox-graphics-wgpu = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "vulkan", optional = true }
+fyrox-graphics-wgpu = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "ccr-248d522f-ryd4xx", optional = true }
 # Yoctite's clusters and levels of detail, for the cluster view.
-yoctite = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "vulkan", optional = true }
+yoctite = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "ccr-248d522f-ryd4xx", optional = true }
 
 [features]
 raytracing = ["dep:fyrox-graphics-wgpu", "dep:yoctite", "fyrox/backend_wgpu"]
 
 [dev-dependencies]
-fyrox = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "vulkan", default-features = false, features = ["backend_wgpu"] }
-fyrox-graphics-wgpu = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "vulkan" }
+fyrox = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "ccr-248d522f-ryd4xx", default-features = false, features = ["backend_wgpu"] }
+fyrox-graphics-wgpu = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "ccr-248d522f-ryd4xx" }
 
 [[example]]
 name = "glass"

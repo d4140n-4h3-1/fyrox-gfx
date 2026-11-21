@@ -38,13 +38,14 @@ use fyrox::{
     renderer::{
         cache::shader::{binding, property, PropertyGroup, RenderMaterial, RenderPassContainer},
         make_viewport_matrix,
-        observer::Observer,
+        observer::{Observer, ObserverPosition},
         resources::RendererResources,
         cache::texture::TextureCache,
         GBufferPassContext, SceneRenderPass, SceneRenderPassContext, TakenOverMeshes,
     },
     asset::manager::ResourceManager,
     scene::{
+        collider::BitMask,
         graph::Graph,
         mesh::{
             buffer::{VertexAttributeUsage, VertexReadTrait},
@@ -52,6 +53,7 @@ use fyrox::{
             Mesh, RenderPath,
         },
         node::Node,
+        Scene,
     },
 };
 use fyrox_graphics_wgpu::{
@@ -61,7 +63,12 @@ use fyrox_graphics_wgpu::{
         PoolVertex, YoctiteMaterial,
     },
 };
-use std::{any::TypeId, collections::hash_map::Entry, sync::Arc, time::Instant};
+use std::{
+    any::TypeId,
+    collections::hash_map::Entry,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use yoctite::ClusterDag;
 
 /// Lays the cluster view over the frame where it drew anything.
@@ -81,12 +88,6 @@ pub enum Mode {
         /// Whether the clusters are chosen on the GPU.
         on_gpu: bool,
     },
-}
-
-/// A surface's clusters, in the pool and as built.
-struct Built {
-    mesh: MeshId,
-    dag: Arc<ClusterDag>,
 }
 
 /// A mesh node's surface placed in the pool.
@@ -166,24 +167,68 @@ impl Materials {
     }
 }
 
+/// How long a scene's pool is kept while the scene is not drawn: a scene switched off for longer,
+/// or gone, lets its GPU memory go, and is placed again if it is drawn again.
+const KEEP_UNDRAWN_SCENE: Duration = Duration::from_secs(10);
+
 /// Yoctite in the renderer: see the module's description. [`crate::GraphicsEffects::with_yoctite`]
 /// and [`crate::GraphicsEffects::with_yoctite_view`] add it.
 pub struct YoctitePass {
     source_type_id: TypeId,
     mode: Mode,
-    /// The meshes it draws, which the renderer leaves out of its own draw.
+    /// The meshes it draws, scene by scene, which the renderer leaves out of its own draw.
     taken_over: Option<TakenOverMeshes>,
-    pool: Option<GeometryPool>,
-    culler: Option<Culler>,
     drawer: Option<GBufferDrawer>,
     view: Option<ClusterView>,
     shader: Option<RenderPassContainer>,
-    built: FxHashMap<u64, Built>,
+    /// Each surface's clusters as built, by its data: built once, whichever scenes it is in.
+    dags: FxHashMap<u64, Arc<ClusterDag>>,
+    /// What is kept for each scene drawn: node handles are only unique within their scene, and
+    /// the GPU draws everything in a pool, so each scene has a pool of its own.
+    scenes: FxHashMap<Handle<Scene>, ScenePool>,
+    failed: bool,
+}
+
+impl std::fmt::Debug for YoctitePass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("YoctitePass")
+            .field("mode", &self.mode)
+            .field("scenes", &self.scenes.len())
+            .field("built", &self.dags.len())
+            .field("failed", &self.failed)
+            .finish()
+    }
+}
+
+/// A scene's meshes in Yoctite: its own pool, what is placed in it, the materials they are drawn
+/// with and the culler that chooses their clusters.
+struct ScenePool {
+    pool: GeometryPool,
+    culler: Option<Culler>,
+    /// Each surface's mesh in this pool, by the surface's data.
+    meshes: FxHashMap<u64, MeshId>,
     placed: FxHashMap<(Handle<Node>, usize), Placed>,
     materials: Materials,
+    /// How many times it has been brought in step with its scene.
     frame: u64,
-    failed: bool,
+    /// When it was last drawn, to let it go when its scene no longer is.
+    drawn: Instant,
     overflow_reported: bool,
+}
+
+impl ScenePool {
+    fn new(server: &WgpuGraphicsServer) -> Self {
+        Self {
+            pool: GeometryPool::new(&server.state.device, 1 << 16),
+            culler: None,
+            meshes: Default::default(),
+            placed: Default::default(),
+            materials: Default::default(),
+            frame: 0,
+            drawn: Instant::now(),
+            overflow_reported: false,
+        }
+    }
 }
 
 impl YoctitePass {
@@ -194,17 +239,38 @@ impl YoctitePass {
             source_type_id,
             mode,
             taken_over,
-            pool: None,
-            culler: None,
             drawer: None,
             view: None,
             shader: None,
-            built: Default::default(),
-            placed: Default::default(),
-            materials: Default::default(),
-            frame: 0,
+            dags: Default::default(),
+            scenes: Default::default(),
             failed: false,
-            overflow_reported: false,
+        }
+    }
+
+    /// The pool of `scene`, made if it has none; and the pools of scenes not drawn for a while let
+    /// go, with the meshes they had taken over.
+    fn scene_pool(&mut self, server: &WgpuGraphicsServer, scene: Handle<Scene>) -> &mut ScenePool {
+        let now = Instant::now();
+        let taken_over = &self.taken_over;
+        self.scenes.retain(|&handle, pool| {
+            let keep = handle == scene || now.duration_since(pool.drawn) < KEEP_UNDRAWN_SCENE;
+            if !keep {
+                if let Some(taken_over) = taken_over {
+                    taken_over.borrow_mut().remove(&handle);
+                }
+            }
+            keep
+        });
+        let pool = self.scenes.entry(scene).or_insert_with(|| ScenePool::new(server));
+        pool.drawn = now;
+        pool
+    }
+
+    /// Gives every scene's meshes back to the renderer.
+    fn give_back_all(&self) {
+        if let Some(taken_over) = &self.taken_over {
+            taken_over.borrow_mut().clear();
         }
     }
 }
@@ -414,125 +480,187 @@ fn view_projection_of(observer: &Observer) -> [[f32; 4]; 4] {
     out
 }
 
-impl YoctitePass {
-    /// Keeps the pool in step with the scene's meshes: new surfaces built and uploaded, new
-    /// mesh nodes placed, moved ones moved, gone ones taken out. Drawing in place of the renderer,
-    /// only meshes whose materials it can draw are placed, and each with its material's slot.
-    /// Returns the mesh nodes placed.
-    fn sync(&mut self, server: &WgpuGraphicsServer, graph: &Graph) -> FxHashSet<Handle<Node>> {
-        let device = &server.state.device;
-        let queue = &server.state.queue;
-        let rendering = self.mode == Mode::Render;
-        let pool = self.pool.get_or_insert_with(|| GeometryPool::new(device, 1 << 16));
-        self.frame += 1;
-        let frame = self.frame;
-        let mut newly_built = (0, 0usize, 0.0f64);
-        let mut nodes = FxHashSet::default();
-        for (handle, node) in graph.pair_iter() {
-            let Some(mesh) = node.cast::<Mesh>() else {
-                continue;
-            };
-            // Skinned meshes, those with blend shapes and those drawn forward stay the renderer's.
-            if !node.global_visibility()
-                || mesh.render_path() != RenderPath::Deferred
-                || mesh.surfaces().iter().any(|s| {
-                    !s.bones().is_empty() || s.data().data_ref().blend_shapes_container.is_some()
-                })
-            {
-                continue;
-            }
-            let shadings: Option<Vec<Shading>> = if rendering {
-                mesh.surfaces().iter().map(|s| shading(s.material())).collect()
-            } else {
-                Some(vec![Shading::Standard; mesh.surfaces().len()])
-            };
-            let Some(shadings) = shadings else {
-                continue;
-            };
-            nodes.insert(handle);
-            let transform = node.global_transform();
-            for ((n, surface), shading) in mesh.surfaces().iter().enumerate().zip(shadings) {
-                let data = surface.data().key();
-                let mesh = match self.built.entry(data) {
-                    Entry::Occupied(built) => built.get().mesh,
-                    Entry::Vacant(place) => {
-                        let (vertices, indices) = read_surface(surface);
-                        let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
-                        // With its texture coordinates, so a level of detail that drags its
-                        // texture across it counts the drag as error.
-                        let uvs: Vec<[f32; 2]> = vertices.iter().map(|v| v.uv).collect();
-                        let started = Instant::now();
-                        let dag = yoctite::build(
-                            &yoctite::Mesh::new(&positions, &indices).with_texture_coordinates(&uvs),
-                            Default::default(),
-                        );
-                        newly_built.0 += 1;
-                        newly_built.1 += indices.len() / 3;
-                        newly_built.2 += started.elapsed().as_secs_f64();
-                        let mesh = pool.add_mesh(device, queue, &dag, &vertices);
-                        place.insert(Built { mesh, dag: Arc::new(dag) }).mesh
-                    }
-                };
-                let material = if rendering { surface.material().key() } else { 0 };
-                match self.placed.get_mut(&(handle, n)) {
-                    Some(placed) if placed.data == data && placed.material == material => {
-                        if placed.transform != transform {
-                            pool.move_instance(queue, placed.instance, rows(&transform));
-                            placed.transform = transform;
-                        }
-                        placed.seen = frame;
-                    }
-                    other => {
-                        if let Some(old) = other {
-                            pool.remove_instance(queue, old.instance);
-                            if rendering {
-                                self.materials.give_back(old.material);
-                            }
-                        }
-                        let slot = if rendering { self.materials.take(surface.material(), shading) } else { 0 };
-                        let instance = pool.add_instance(device, queue, mesh, rows(&transform), slot);
-                        self.placed.insert(
-                            (handle, n),
-                            Placed {
-                                instance,
-                                data,
-                                material,
-                                transform,
-                                seen: frame,
-                            },
-                        );
-                    }
+/// The mesh nodes the renderer would draw from `position` with `render_mask`, as far as nodes
+/// go: in the render mask, visible, enabled, and not left out by a level of detail - nor below one that is, since
+/// the renderer skips that whole branch. Yoctite draws no more than these, so that a mesh it takes
+/// over is one the renderer would have drawn.
+fn drawable_meshes<'a>(
+    graph: &'a Graph,
+    position: &ObserverPosition,
+    render_mask: BitMask,
+) -> Vec<(Handle<Node>, &'a Node, &'a Mesh)> {
+    // Levels of detail as the renderer chooses them: by distance from the observer, between its
+    // near and far planes; where an object is in several levels, the last one decides.
+    let mut lod_visible: FxHashMap<u32, bool> = FxHashMap::default();
+    for (_, node) in graph.pair_iter() {
+        let Some(group) = node.lod_group() else {
+            continue;
+        };
+        for level in group.levels.iter() {
+            for &object in level.objects.iter() {
+                if let Ok(object_ref) = graph.try_get_node(object) {
+                    let distance = position.translation.metric_distance(&object_ref.global_position());
+                    let normalized = (distance - position.z_near) / (position.z_far - position.z_near);
+                    lod_visible.insert(object.index(), normalized >= level.begin() && normalized <= level.end());
                 }
             }
         }
-        let materials = &mut self.materials;
-        self.placed.retain(|_, placed| {
-            let keep = placed.seen == frame;
-            if !keep {
-                pool.remove_instance(queue, placed.instance);
-                if rendering {
-                    materials.give_back(placed.material);
-                }
-            }
-            keep
-        });
-        if newly_built.0 > 0 {
-            let stats = pool.stats();
-            Log::info(format!(
-                "Yoctite: built {} surfaces ({} triangles) in {:.2} s; the pool holds {} meshes, {} instances, \
-                 {} clusters, {:.1} MB",
-                newly_built.0,
-                newly_built.1,
-                newly_built.2,
-                stats.meshes,
-                stats.instances,
-                stats.clusters,
-                stats.bytes as f64 / 1048576.0
-            ));
-        }
-        nodes
     }
+    let mut meshes = Vec::new();
+    let mut stack = vec![graph.root()];
+    while let Some(handle) = stack.pop() {
+        if lod_visible.get(&handle.index()) == Some(&false) {
+            continue;
+        }
+        let Ok(node) = graph.try_get_node(handle) else {
+            continue;
+        };
+        stack.extend_from_slice(node.children());
+        if let Some(mesh) = node.cast::<Mesh>() {
+            if *node.render_mask & render_mask != BitMask::none()
+                && node.global_visibility()
+                && node.is_globally_enabled()
+            {
+                meshes.push((handle, node, mesh));
+            }
+        }
+    }
+    meshes
+}
 
+/// Keeps `scene`'s pool in step with the scene's meshes as `observer` would draw them: new
+/// surfaces built (once, into `dags`) and uploaded, new mesh nodes placed, moved ones moved, gone
+/// ones taken out. Drawing in place of the renderer (`rendering`), only meshes whose materials it
+/// can draw are placed, and each with its material's slot. Returns the mesh nodes placed.
+fn sync(
+    scene: &mut ScenePool,
+    dags: &mut FxHashMap<u64, Arc<ClusterDag>>,
+    rendering: bool,
+    server: &WgpuGraphicsServer,
+    graph: &Graph,
+    observer: &Observer,
+) -> FxHashSet<Handle<Node>> {
+    let device = &server.state.device;
+    let queue = &server.state.queue;
+    let ScenePool {
+        pool,
+        meshes,
+        placed: placements,
+        materials,
+        frame,
+        ..
+    } = scene;
+    *frame += 1;
+    let frame = *frame;
+    let mut newly_built = (0, 0usize, 0.0f64);
+    let mut nodes = FxHashSet::default();
+    for (handle, node, mesh) in drawable_meshes(graph, &observer.position, observer.render_mask) {
+        // Skinned meshes, those with blend shapes and those drawn forward stay the renderer's.
+        if mesh.render_path() != RenderPath::Deferred
+            || mesh
+                .surfaces()
+                .iter()
+                .any(|s| !s.bones().is_empty() || s.data().data_ref().blend_shapes_container.is_some())
+        {
+            continue;
+        }
+        let shadings: Option<Vec<Shading>> = if rendering {
+            mesh.surfaces().iter().map(|s| shading(s.material())).collect()
+        } else {
+            Some(vec![Shading::Standard; mesh.surfaces().len()])
+        };
+        let Some(shadings) = shadings else {
+            continue;
+        };
+        nodes.insert(handle);
+        let transform = node.global_transform();
+        for ((n, surface), shading) in mesh.surfaces().iter().enumerate().zip(shadings) {
+            let data = surface.data().key();
+            let mesh = match meshes.entry(data) {
+                Entry::Occupied(mesh) => *mesh.get(),
+                Entry::Vacant(place) => {
+                    let (vertices, indices) = read_surface(surface);
+                    let dag = match dags.entry(data) {
+                        Entry::Occupied(dag) => dag.get().clone(),
+                        Entry::Vacant(place) => {
+                            let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+                            // With its texture coordinates, so a level of detail that drags its
+                            // texture across it counts the drag as error.
+                            let uvs: Vec<[f32; 2]> = vertices.iter().map(|v| v.uv).collect();
+                            let started = Instant::now();
+                            let dag = yoctite::build(
+                                &yoctite::Mesh::new(&positions, &indices).with_texture_coordinates(&uvs),
+                                Default::default(),
+                            );
+                            newly_built.0 += 1;
+                            newly_built.1 += indices.len() / 3;
+                            newly_built.2 += started.elapsed().as_secs_f64();
+                            place.insert(Arc::new(dag)).clone()
+                        }
+                    };
+                    *place.insert(pool.add_mesh(device, queue, &dag, &vertices))
+                }
+            };
+            let material = if rendering { surface.material().key() } else { 0 };
+            match placements.get_mut(&(handle, n)) {
+                Some(placed) if placed.data == data && placed.material == material => {
+                    if placed.transform != transform {
+                        pool.move_instance(queue, placed.instance, rows(&transform));
+                        placed.transform = transform;
+                    }
+                    placed.seen = frame;
+                }
+                other => {
+                    if let Some(old) = other {
+                        pool.remove_instance(queue, old.instance);
+                        if rendering {
+                            materials.give_back(old.material);
+                        }
+                    }
+                    let slot = if rendering { materials.take(surface.material(), shading) } else { 0 };
+                    let instance = pool.add_instance(device, queue, mesh, rows(&transform), slot);
+                    placements.insert(
+                        (handle, n),
+                        Placed {
+                            instance,
+                            data,
+                            material,
+                            transform,
+                            seen: frame,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    placements.retain(|_, placed| {
+        let keep = placed.seen == frame;
+        if !keep {
+            pool.remove_instance(queue, placed.instance);
+            if rendering {
+                materials.give_back(placed.material);
+            }
+        }
+        keep
+    });
+    if newly_built.0 > 0 {
+        let stats = pool.stats();
+        Log::info(format!(
+            "Yoctite: built {} surfaces ({} triangles) in {:.2} s; the scene's pool holds {} meshes, {} instances, \
+             {} clusters, {:.1} MB",
+            newly_built.0,
+            newly_built.1,
+            newly_built.2,
+            stats.meshes,
+            stats.instances,
+            stats.clusters,
+            stats.bytes as f64 / 1048576.0
+        ));
+    }
+    nodes
+}
+
+impl ScenePool {
     /// What the GPU chose, read back a frame or two late, as clusters and triangles; warning once
     /// if its list ran out of room.
     fn chosen(&mut self, what: &str) -> Option<(usize, usize)> {
@@ -554,24 +682,19 @@ impl YoctitePass {
 /// The clusters to draw from where the camera is, chosen on the CPU, as instance slots and pool
 /// clusters, and how many triangles they come to: the reference for the GPU's choice.
 fn choose(
-    built: &FxHashMap<u64, Built>,
-    placed: &FxHashMap<(Handle<Node>, usize), Placed>,
-    pool: &GeometryPool,
+    dags: &FxHashMap<u64, Arc<ClusterDag>>,
+    scene: &ScenePool,
     view_projection: &Matrix4<f32>,
     eye: Vector3<f32>,
     threshold: f32,
 ) -> (Vec<[u32; 2]>, usize) {
     let mut list = Vec::new();
     let mut triangles = 0;
-    let by_mesh: FxHashMap<MeshId, &Built> = built.values().map(|b| (b.mesh, b)).collect();
-    for placed in placed.values() {
-        let Some(record) = pool.instance(placed.instance) else {
+    for placed in scene.placed.values() {
+        let (Some(dag), Some(&mesh)) = (dags.get(&placed.data), scene.meshes.get(&placed.data)) else {
             continue;
         };
-        let Some(built) = by_mesh.get(&MeshId(record.mesh)) else {
-            continue;
-        };
-        let Some(mesh) = pool.mesh(built.mesh) else {
+        let Some(mesh) = scene.pool.mesh(mesh) else {
             continue;
         };
         let t = &placed.transform;
@@ -585,8 +708,8 @@ fn choose(
             continue;
         };
         let local = inverse.transform_point(&Point3::from(eye));
-        for c in yoctite::select(&built.dag, [local.x, local.y, local.z], threshold) {
-            triangles += built.dag.clusters[c as usize].triangles.len();
+        for c in yoctite::select(dag, [local.x, local.y, local.z], threshold) {
+            triangles += dag.clusters[c as usize].triangles.len();
             list.push([placed.instance.0, mesh.first_cluster + c]);
         }
     }
@@ -601,14 +724,25 @@ impl SceneRenderPass for YoctitePass {
         let Some(server) = ctx.server.as_any().downcast_ref::<WgpuGraphicsServer>() else {
             return Ok(Default::default());
         };
+        let device = &server.state.device;
         let started = Instant::now();
-        let nodes = self.sync(server, &ctx.scene.graph);
-        // From the next frame on the renderer leaves these out: this one, it drew them already,
-        // which drawing them again changes nothing of.
-        if let Some(taken_over) = &self.taken_over {
-            *taken_over.borrow_mut() = nodes;
+        let scene_handle = ctx.scene_handle;
+        self.scene_pool(server, scene_handle);
+        let Self {
+            scenes,
+            dags,
+            taken_over,
+            drawer,
+            ..
+        } = self;
+        let scene = scenes.get_mut(&scene_handle).expect("made above");
+        let nodes = sync(scene, dags, true, server, &ctx.scene.graph, ctx.observer);
+        // From the next frame on the renderer leaves these out of this scene: this one, it drew
+        // them already, which drawing them again changes nothing of.
+        if let Some(taken_over) = taken_over {
+            taken_over.borrow_mut().insert(scene_handle, nodes);
         }
-        let materials: Vec<YoctiteMaterial> = self
+        let materials: Vec<YoctiteMaterial> = scene
             .materials
             .by_key
             .values()
@@ -621,30 +755,26 @@ impl SceneRenderPass for YoctitePass {
             view_projection: view_projection_of(ctx.observer),
             eye: eye.into(),
             threshold: pixel_threshold(ctx.observer),
-            material_slots: self.materials.slots().max(1),
+            material_slots: scene.materials.slots().max(1),
         };
-        let device = &server.state.device;
-        let culler = self.culler.get_or_insert_with(|| Culler::new(device));
-        let drawer = self.drawer.get_or_insert_with(|| GBufferDrawer::new(device));
-        let pool = self.pool.as_ref().expect("made by sync");
+        let culler = scene.culler.get_or_insert_with(|| Culler::new(device));
+        let drawer = drawer.get_or_insert_with(|| GBufferDrawer::new(device));
         let started = Instant::now();
-        let draws = match drawer.draw(server, pool, culler, &parameters, ctx.framebuffer, &materials) {
+        let draws = match drawer.draw(server, &scene.pool, culler, &parameters, ctx.framebuffer, &materials) {
             Ok(draws) => draws,
             Err(err) => {
                 Log::err(format!("Yoctite failed, leaving the meshes to the renderer: {err:?}"));
                 self.failed = true;
-                if let Some(taken_over) = &self.taken_over {
-                    taken_over.borrow_mut().clear();
-                }
+                self.give_back_all();
                 return Ok(Default::default());
             }
         };
         let drew = started.elapsed().as_secs_f64();
-        let (clusters, triangles) = self.chosen("").unwrap_or_default();
-        if self.frame % STATS_EVERY == 1 {
+        let (clusters, triangles) = scene.chosen("").unwrap_or_default();
+        if scene.frame % STATS_EVERY == 1 {
             Log::info(format!(
-                "Yoctite: {clusters} clusters, {triangles} triangles in {} draws ({} materials); the CPU took {:.2} ms \
-                 keeping up with the scene and its materials and {:.2} ms choosing and drawing",
+                "Yoctite ({scene_handle}): {clusters} clusters, {triangles} triangles in {} draws ({} materials); \
+                 the CPU took {:.2} ms keeping up with the scene and its materials and {:.2} ms choosing and drawing",
                 draws.draw_calls,
                 materials.len(),
                 synced * 1000.0,
@@ -672,8 +802,13 @@ impl SceneRenderPass for YoctitePass {
                 .map_err(|e| FrameworkError::Custom(format!("Yoctite view shader: {e:?}")))?;
             self.shader = Some(RenderPassContainer::new(ctx.server, &shader)?);
         }
+        let device = &server.state.device;
         let started = Instant::now();
-        self.sync(server, &ctx.scene.graph);
+        let scene_handle = ctx.scene_handle;
+        self.scene_pool(server, scene_handle);
+        let Self { scenes, dags, view, .. } = self;
+        let scene = scenes.get_mut(&scene_handle).expect("made above");
+        sync(scene, dags, false, server, &ctx.scene.graph, ctx.observer);
         let synced = started.elapsed().as_secs_f64();
 
         let position = &ctx.observer.position;
@@ -682,16 +817,15 @@ impl SceneRenderPass for YoctitePass {
         let view_projection = view_projection_of(ctx.observer);
         let eye = position.translation;
         let (width, height) = (viewport.w() as u32, viewport.h() as u32);
-        let view = self.view.get_or_insert_with(|| ClusterView::new(&server.state.device));
-        let pool = self.pool.as_ref().expect("made by sync");
+        let view = view.get_or_insert_with(|| ClusterView::new(device));
         let started = Instant::now();
         let (drawn, cpu_chosen) = if on_gpu {
-            let culler = self.culler.get_or_insert_with(|| Culler::new(&server.state.device));
-            let drawn = view.draw_culled(server, pool, culler, view_projection, eye.into(), threshold, width, height);
+            let culler = scene.culler.get_or_insert_with(|| Culler::new(device));
+            let drawn = view.draw_culled(server, &scene.pool, culler, view_projection, eye.into(), threshold, width, height);
             (drawn, None)
         } else {
-            let (list, triangles) = choose(&self.built, &self.placed, pool, &position.view_projection_matrix, eye, threshold);
-            let drawn = view.draw(server, pool, view_projection, width, height, &list);
+            let (list, triangles) = choose(dags, scene, &position.view_projection_matrix, eye, threshold);
+            let drawn = view.draw(server, &scene.pool, view_projection, width, height, &list);
             (drawn, Some((list.len(), triangles)))
         };
         let chose = started.elapsed().as_secs_f64();
@@ -703,11 +837,11 @@ impl SceneRenderPass for YoctitePass {
                 return Ok(Default::default());
             }
         };
-        let (clusters, triangles) = cpu_chosen.or_else(|| self.chosen("view")).unwrap_or_default();
-        if self.frame % STATS_EVERY == 1 {
+        let (clusters, triangles) = cpu_chosen.or_else(|| scene.chosen("view")).unwrap_or_default();
+        if scene.frame % STATS_EVERY == 1 {
             Log::info(format!(
-                "Yoctite view: {} clusters, {} triangles, chosen on the {}; the pool kept up with the scene \
-                 in {:.2} ms, choosing and drawing took the CPU {:.2} ms",
+                "Yoctite view ({scene_handle}): {} clusters, {} triangles, chosen on the {}; the pool kept up with \
+                 the scene in {:.2} ms, choosing and drawing took the CPU {:.2} ms",
                 clusters,
                 triangles,
                 if on_gpu { "GPU" } else { "CPU" },
@@ -771,6 +905,53 @@ mod tests {
     fn rows_are_the_top_of_the_matrix() {
         let m = Matrix4::new_translation(&Vector3::new(1.0, 2.0, 3.0));
         assert_eq!(rows(&m), [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0, 3.0]);
+    }
+
+    #[test]
+    fn drawn_meshes_are_those_the_renderer_would_draw() {
+        use fyrox::scene::{
+            base::{BaseBuilder, LevelOfDetail, LodGroup},
+            mesh::MeshBuilder,
+            pivot::PivotBuilder,
+            transform::TransformBuilder,
+        };
+        let mut graph = Graph::new();
+        let at = |z: f32| TransformBuilder::new().with_local_position(Vector3::new(0.0, 0.0, z)).build();
+        let plain = MeshBuilder::new(BaseBuilder::new()).build(&mut graph).to_base::<Node>();
+        let masked = MeshBuilder::new(BaseBuilder::new()).build(&mut graph).to_base::<Node>();
+        *graph[masked].render_mask = BitMask(0b10);
+        let hidden = MeshBuilder::new(BaseBuilder::new().with_visibility(false)).build(&mut graph).to_base::<Node>();
+        let disabled = MeshBuilder::new(BaseBuilder::new().with_enabled(false)).build(&mut graph).to_base::<Node>();
+        let near = MeshBuilder::new(BaseBuilder::new().with_local_transform(at(1.0))).build(&mut graph).to_base::<Node>();
+        let under_far = MeshBuilder::new(BaseBuilder::new()).build(&mut graph).to_base::<Node>();
+        let far = MeshBuilder::new(BaseBuilder::new().with_local_transform(at(1.0)).with_child(under_far))
+            .build(&mut graph).to_base::<Node>();
+        PivotBuilder::new(BaseBuilder::new().with_lod_group(LodGroup {
+            levels: vec![
+                LevelOfDetail::new(0.0, 0.1, vec![near]),
+                LevelOfDetail::new(0.1, 1.0, vec![far]),
+            ],
+        }))
+        .build(&mut graph);
+        graph.update_hierarchical_data();
+
+        let position = ObserverPosition {
+            z_near: 0.1,
+            z_far: 100.0,
+            ..Default::default()
+        };
+        let drawn = |mask| -> FxHashSet<Handle<Node>> {
+            drawable_meshes(&graph, &position, mask).into_iter().map(|(h, ..)| h).collect()
+        };
+        let all = drawn(BitMask(0b01));
+        assert!(all.contains(&plain));
+        assert!(!all.contains(&masked), "outside the camera's render mask");
+        assert!(!all.contains(&hidden), "hidden");
+        assert!(!all.contains(&disabled), "disabled");
+        assert!(all.contains(&near), "its level of detail is the one shown up close");
+        assert!(!all.contains(&far), "its level of detail is not shown up close");
+        assert!(!all.contains(&under_far), "under a level of detail not shown");
+        assert!(drawn(BitMask(0b11)).contains(&masked), "inside the render mask");
     }
 
     #[test]
