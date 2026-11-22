@@ -10,6 +10,8 @@ license = "MIT"
 [workspace]
 
 [dependencies]
+# The wind offsets of meshes that bend are kept as half floats (Yoctite, traced shadows).
+half = "2.2.1"
 # No default features: the game using this crate decides between OpenGL and wgpu (Vulkan).
 fyrox = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "vulkan", default-features = false }
 

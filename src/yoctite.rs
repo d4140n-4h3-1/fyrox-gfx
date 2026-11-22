@@ -14,9 +14,13 @@
 //! [`Mode::Render`] draws them into the G-Buffer, a draw for each material, in place of the
 //! renderer's own draw of those meshes (`Renderer::set_taken_over_meshes`): lit, shadowed,
 //! fogged and smoothed as everything else is. Only what it can draw as the engine does is taken
-//! over: visible meshes, not skinned and without blend shapes, drawn deferred, every surface's
-//! material of the engine's standard or glTF shader, without a lightmap. The rest stays the
-//! renderer's.
+//! over: visible meshes, not skinned, drawn deferred, every surface's material of the engine's
+//! standard or glTF shader, without a lightmap. The rest stays the renderer's.
+//!
+//! Meshes with blend shapes are taken over too, and bend as the renderer would bend them: their
+//! offsets go into the pool with their vertices, and each node's weights are handed to its
+//! instances whenever they change - a forest swaying in the wind, at every level of detail. Their
+//! bounds are grown by as far as weights of up to [`MOST_WEIGHT`] can move them.
 //!
 //! [`Mode::View`] instead lays the clusters over the frame, each in a colour of its own: to see
 //! them, and which levels of detail are drawn. It can choose them on the CPU (`yoctite::select`)
@@ -61,7 +65,7 @@ use fyrox_graphics_wgpu::{
     server::WgpuGraphicsServer,
     yoctite::{
         ClusterView, CullParameters, Culler, GBufferDrawer, GeometryPool, InstanceId, MaterialParams, MeshId,
-        PoolVertex, YoctiteMaterial,
+        Morphs, PoolVertex, YoctiteMaterial,
     },
 };
 use std::{
@@ -74,6 +78,13 @@ use yoctite::ClusterDag;
 
 /// Lays the cluster view over the frame where it drew anything.
 const WGSL: &str = include_str!("shaders/yoctite_view_wgsl.shader");
+
+/// The largest blend shape weight the bounds of a bending mesh's clusters allow for, either way
+/// (1 is a shape at full strength): a mesh bent further may have clusters culled while still in
+/// view. The bounds allow for every shape at this at once, which shapes that take turns - a
+/// sway's sine and cosine - never are, so a little past it is still safe. Bigger bounds cull
+/// less: at 2, a swaying forest drew a sixth more triangles.
+pub const MOST_WEIGHT: f32 = 1.5;
 
 /// How many frames apart the statistics are logged.
 const STATS_EVERY: u64 = 300;
@@ -119,6 +130,8 @@ struct Drawn {
     transform: Matrix4<f32>,
     /// The last frame it was seen in, to take out what has gone.
     seen: u64,
+    /// The weights last given its blend shapes, to tell when they change.
+    weights: Vec<f32>,
 }
 
 /// How a material is drawn into the G-Buffer: as the engine's glTF shader does, or its standard
@@ -392,6 +405,55 @@ fn read_surface(surface: &Surface) -> (Vec<PoolVertex>, Vec<u32>) {
     (vertices, indices)
 }
 
+/// A mesh node's blend shape weights, 1 at full strength.
+fn mesh_weights(node: &Node) -> Vec<f32> {
+    node.cast::<Mesh>()
+        .map(|mesh| mesh.blend_shapes().iter().map(|s| s.weight / 100.0).collect())
+        .unwrap_or_default()
+}
+
+/// A surface's blend shapes, if it has them: how many, and for each of its first `count`
+/// vertices, how far each moves its position and normal at full strength.
+///
+/// They are read from the volume texture the engine packs them into for its shaders
+/// (`BlendShapesContainer::from_lists`): a layer a shape, in which each vertex's position, normal
+/// and tangent offsets follow one another as three texels of three half floats, vertex after
+/// vertex, in rows of up to 512.
+pub(crate) fn read_morphs(surface: &Surface, count: usize) -> Option<(u32, Vec<Vec<[f32; 6]>>)> {
+    let data = surface.data();
+    let data = data.data_ref();
+    let container = data.blend_shapes_container.as_ref()?;
+    let storage = container.blend_shape_storage.as_ref()?;
+    let n = data.vertex_buffer.vertex_count() as usize;
+    let targets = container.blend_shapes.len();
+    if n == 0 || targets == 0 {
+        return None;
+    }
+    let width = n.min(512);
+    let height = n.div_ceil(width);
+    let texture = storage.data_ref();
+    let bytes = texture.data();
+    if bytes.len() < targets * width * height * 18 {
+        Log::warn("Yoctite: a surface's blend shapes are not packed as expected; it is drawn unbent");
+        return None;
+    }
+    let half_at = |at: usize| half::f16::from_le_bytes([bytes[at], bytes[at + 1]]).to_f32();
+    let offsets = (0..count)
+        .map(|vertex| {
+            (0..targets)
+                .map(|layer| {
+                    if vertex >= n {
+                        return [0.0; 6];
+                    }
+                    let at = (layer * width * height + vertex) * 18;
+                    std::array::from_fn(|i| half_at(at + 2 * i))
+                })
+                .collect()
+        })
+        .collect();
+    Some((targets as u32, offsets))
+}
+
 /// `m`'s top three rows, row by row, as an instance is placed with.
 fn rows(m: &Matrix4<f32>) -> [f32; 12] {
     let mut out = [0.0; 12];
@@ -606,6 +668,7 @@ impl SceneMeshes {
             }
         };
         let mut uploaded = 0;
+        let mut bending = 0;
         let mut changed = false;
         for (handle, node) in graph.pair_iter() {
             let Some(mesh) = node.cast::<Mesh>() else {
@@ -626,12 +689,10 @@ impl SceneMeshes {
                     release(pool, materials, &old);
                     changed |= taken_over.remove(&handle);
                 }
-                // Skinned meshes and those with blend shapes stay the renderer's, and so do
-                // those with a material Yoctite cannot draw as the engine does - or not yet: one
-                // still loading is looked into again next frame.
-                let shadings: Option<Vec<Shading>> = if surfaces.iter().any(|s| {
-                    !s.bones().is_empty() || s.data().data_ref().blend_shapes_container.is_some()
-                }) {
+                // Skinned meshes stay the renderer's, and so do those with a material Yoctite
+                // cannot draw as the engine does - or not yet: one still loading is looked into
+                // again next frame.
+                let shadings: Option<Vec<Shading>> = if surfaces.iter().any(|s| !s.bones().is_empty()) {
                     None
                 } else if rendering {
                     surfaces.iter().map(|s| shading(s.material())).collect()
@@ -649,12 +710,25 @@ impl SceneMeshes {
                         placed: Vec::new(),
                         transform: Matrix4::identity(),
                         seen: frame,
+                        weights: Vec::new(),
                     },
                 );
             }
             let drawn = nodes.get_mut(&handle).expect("found or made above");
             drawn.seen = frame;
             let transform = node.global_transform();
+            // The engine's weights are in percent.
+            let shapes = mesh.blend_shapes();
+            if !drawn.placed.is_empty()
+                && (drawn.weights.len() != shapes.len()
+                    || drawn.weights.iter().zip(shapes).any(|(w, s)| *w != s.weight / 100.0))
+            {
+                drawn.weights = shapes.iter().map(|s| s.weight / 100.0).collect();
+                for placed in &drawn.placed {
+                    pool.set_weights(placed.instance, &drawn.weights);
+                }
+
+            }
             if !drawn.placed.is_empty() {
                 if drawn.transform != transform {
                     for placed in &drawn.placed {
@@ -681,11 +755,27 @@ impl SceneMeshes {
                     Entry::Vacant(place) => {
                         let dag = builder.dag(surface).expect("built, as checked above");
                         let (mut vertices, _) = read_surface(surface);
+                        let morphs = read_morphs(surface, vertices.len());
                         // With the vertices its coarser levels made: grown foliage cards'
-                        // corners.
+                        // corners, which bend as the vertices they copy do.
                         dag.extend_vertices(&mut vertices, |v, at| v.position = at);
+                        let morphs = morphs.map(|(targets, mut offsets)| {
+                            dag.extend_vertices(&mut offsets, |_, _| {});
+                            (targets, offsets.concat())
+                        });
                         uploaded += 1;
-                        let mesh = pool.add_mesh(device, queue, &dag, &vertices);
+                        bending += morphs.is_some() as usize;
+                        let mesh = pool.add_morphing_mesh(
+                            device,
+                            queue,
+                            &dag,
+                            &vertices,
+                            morphs.as_ref().map(|(targets, offsets)| Morphs {
+                                targets: *targets,
+                                offsets,
+                                most_weight: MOST_WEIGHT,
+                            }),
+                        );
                         place.insert(Built { mesh, dag }).mesh
                     }
                 };
@@ -695,11 +785,16 @@ impl SceneMeshes {
                     (0, 0)
                 };
                 let instance = pool.add_instance(device, queue, mesh, rows(&transform), slot);
+                drawn.weights = mesh_weights(node);
+                pool.set_weights(instance, &drawn.weights);
                 drawn.placed.push(Placed { instance, data, material });
             }
             drawn.transform = transform;
             changed |= taken_over.insert(handle);
         }
+
+        // The weights set, to the GPU together.
+        pool.flush(queue);
 
         // Nodes gone, hidden or no longer drawable: theirs goes too.
         let mut removed = false;
@@ -726,7 +821,7 @@ impl SceneMeshes {
         if uploaded > 0 {
             let stats = pool.stats();
             Log::info(format!(
-                "Yoctite: {uploaded} surfaces uploaded; the pool holds {} meshes, {} instances, {} clusters, {:.1} MB",
+                "Yoctite: {uploaded} surfaces uploaded, {bending} of them bending; the pool holds {} meshes, {} instances, {} clusters, {:.1} MB",
                 stats.meshes,
                 stats.instances,
                 stats.clusters,

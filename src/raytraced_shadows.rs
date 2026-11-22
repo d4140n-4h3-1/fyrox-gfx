@@ -43,6 +43,15 @@
 //! still cast shadows while they stand still, since a game hides what the camera cannot see; once a mesh has moved, or if it is skinned, it casts none while
 //! hidden, as with shadow maps.
 //!
+//! A mesh bent by its blend shapes - a tree swaying in the wind - is bent the same way, within
+//! [`BEND_REACH`]: its vertices moved by its weights as the renderer moves them, on the CPU, and
+//! its geometry refitted - if it is big enough for that to show ([`BEND_SMALLEST`]). A forest has
+//! many of them, so each is bent again only every
+//! [`BEND_EVERY`] frames, in turn - its shadow following a sway a moment late, which the frames'
+//! averaging hides - and only the vertices its triangles use. Further off, it casts the shadow of
+//! the mesh unbent. A mesh that bends is never put in with the still meshes, so coming within
+//! reach and going out of it again costs no cube put together again.
+//!
 //! Glass stands in light's way too, but lets it through, taking on its colour: a lamp shone
 //! through red glass casts red light past it. How much of each colour gets through is the glass's
 //! tint, as strongly as its tint strength; glass told not to colour light
@@ -357,6 +366,65 @@ fn instance_transform(transform: &Matrix4<f32>) -> [f32; 12] {
 /// its shadow is too small for its pose to tell.
 pub const SKIN_REACH: f32 = 30.0;
 
+/// How far from the camera a mesh bent by blend shapes is bent in its shadow too, in meters.
+pub const BEND_REACH: f32 = 25.0;
+
+/// How big a mesh has to be, in meters across at its widest, for its shadow to bend with it: a
+/// fern's sway is lost in its own shadow's softness, and a meadow of them would cost more to bend
+/// than all the trees round it.
+pub const BEND_SMALLEST: f32 = 3.0;
+
+/// How many frames apart each bent mesh is bent again: they take turns.
+pub const BEND_EVERY: u64 = 3;
+
+/// A surface with blend shapes as its data has it, read once: where its vertices are in its own
+/// space, how far each shape moves each at full strength, and which of them its triangles use.
+struct Bend {
+    positions: Vec<Vector3<f32>>,
+    /// Shape after shape, a vertex after vertex.
+    offsets: Vec<Vec<Vector3<f32>>>,
+    used: Vec<u32>,
+}
+
+impl Bend {
+    fn read(surface: &Surface) -> Option<Self> {
+        let data = surface.data();
+        let (positions, count) = {
+            let data = data.data_ref();
+            let positions: Vec<Vector3<f32>> = data
+                .vertex_buffer
+                .iter()
+                .map(|v| v.read_3_f32(VertexAttributeUsage::Position).unwrap_or_default())
+                .collect();
+            let count = positions.len();
+            (positions, count)
+        };
+        let (targets, morphs) = crate::yoctite::read_morphs(surface, count)?;
+        let offsets = (0..targets as usize)
+            .map(|t| morphs.iter().map(|m| Vector3::new(m[t][0], m[t][1], m[t][2])).collect())
+            .collect();
+        let mut used: Vec<u32> = triangles(surface, count);
+        used.sort_unstable();
+        used.dedup();
+        Some(Self { positions, offsets, used })
+    }
+
+    /// Its vertices bent by `weights`, 1 a shape at full strength, in its own space, three floats
+    /// each. Those no triangle uses are left where they are.
+    fn pose(&self, weights: &[f32]) -> Vec<f32> {
+        let mut bent = self.positions.clone();
+        for (offsets, &weight) in self.offsets.iter().zip(weights) {
+            if weight == 0.0 {
+                continue;
+            }
+            for &v in &self.used {
+                bent[v as usize] += offsets[v as usize] * weight;
+            }
+        }
+        bent.iter().flat_map(|p| [p.x, p.y, p.z]).collect()
+    }
+}
+
 /// A skinned surface's vertices as its data has them, read once: where each is in its own space,
 /// and the four bones each hangs off, with how much.
 struct Skin {
@@ -627,6 +695,10 @@ pub struct TracedLightShadows {
     /// posed again.
     skins: FxHashMap<u64, Skin>,
     poses: FxHashMap<Shape, Vec<Matrix4<f32>>>,
+    /// Each surface with blend shapes, read once, by its data (or [`None`], if it has none to
+    /// read); and the weights each bent surface was last bent by.
+    bends: FxHashMap<u64, Option<Bend>>,
+    bent: FxHashMap<Shape, Vec<f32>>,
     /// The cutout masks made so far, kept for as long as the scene is traced.
     masks: Masks,
     unsupported_reported: bool,
@@ -666,6 +738,8 @@ impl TracedLightShadows {
             was_fixed: Default::default(),
             skins: Default::default(),
             poses: Default::default(),
+            bends: Default::default(),
+            bent: Default::default(),
             masks: Default::default(),
             unsupported_reported: false,
         }
@@ -710,6 +784,8 @@ impl LightShadowTracer for TracedLightShadows {
             self.was_fixed.clear();
             self.skins.clear();
             self.poses.clear();
+            self.bends.clear();
+            self.bent.clear();
             self.masks.clear();
             self.scene_handle = Some(scene_handle);
         }
@@ -768,6 +844,14 @@ impl LightShadowTracer for TracedLightShadows {
             if (skinned || place.moved) && !node.global_visibility() {
                 continue;
             }
+            // Bent by its blend shapes: its weights, 1 at full strength. A mesh with blend shapes
+            // counts as bending even with them all at nothing - a tree too far off to sway, say -
+            // so that its weights coming and going put no cube together again.
+            let weights: Vec<f32> = mesh.blend_shapes().iter().map(|s| s.weight / 100.0).collect();
+            let bending = !weights.is_empty();
+            let bend_near = bending
+                && camera.is_none_or(|camera| (node.global_position() - camera).norm() < BEND_REACH)
+                && mesh.world_bounding_box().half_extents().max() * 2.0 >= BEND_SMALLEST;
             for (n, surface) in mesh.surfaces().iter().enumerate() {
                 let material = surface.material();
                 let masks = &mut self.masks;
@@ -777,8 +861,26 @@ impl LightShadowTracer for TracedLightShadows {
                 else {
                     continue;
                 };
+                let bend = if bend_near {
+                    let key = surface.data().key();
+                    self.bends.entry(key).or_insert_with(|| Bend::read(surface)).as_ref()
+                } else {
+                    None
+                };
+                if let (true, Some(bend)) = (surface.bones().is_empty(), bend) {
+                    // Bent afresh in its turn, or the first time; between, as it was.
+                    let shape = Shape::Posed(handle, n);
+                    let built = self.geometry.contains_key(&shape);
+                    let turn = (frame + handle.index() as u64) % BEND_EVERY == 0;
+                    if !built || (turn && self.bent.get(&shape) != Some(&weights)) {
+                        posed.insert(shape, bend.pose(&weights));
+                        self.bent.insert(shape, weights.clone());
+                    }
+                    placed.push((shape, instance_transform(&transform), handle, n, how));
+                    continue;
+                }
                 if surface.bones().is_empty() {
-                    if settled && !matches!(how, Blocks::Cutout(_)) {
+                    if settled && !bending && !matches!(how, Blocks::Cutout(_)) {
                         // Where it was last taken to be, not exactly where it is: a drift too
                         // small to count as moving should not put its cube together again.
                         let at = instance_transform(&place.transform);
@@ -912,6 +1014,7 @@ impl LightShadowTracer for TracedLightShadows {
             // afresh.
             let geometry = &self.geometry;
             self.poses.retain(|shape, _| geometry.contains_key(shape));
+            self.bent.retain(|shape, _| geometry.contains_key(shape));
         }
 
         // Posed geometry, refitted where it is this frame.
@@ -1134,6 +1237,49 @@ mod tests {
         let traced = triangles(&surface, 2 * count as usize);
         assert_eq!(traced.len(), front.len() * 3, "each place once");
         assert_eq!(&traced[..], front.iter().flatten().copied().collect::<Vec<_>>().as_slice(), "the first of each kept");
+    }
+
+    #[test]
+    fn a_surface_with_blend_shapes_is_bent_by_its_weights() {
+        use fyrox::{
+            core::{algebra::Matrix4, algebra::Vector3 as V3, num_traits::Zero},
+            fxhash::FxHashMap,
+            scene::mesh::surface::{BlendShapesContainer, InputBlendShapeData, SurfaceData, SurfaceResource},
+        };
+        // A quad; one shape lifts every vertex a meter, the other moves the first one along x.
+        let mut data = SurfaceData::make_quad(&Matrix4::identity());
+        let count = data.vertex_buffer.vertex_count();
+        let f = half::f16::from_f32;
+        let shape = |name: &str, at: &dyn Fn(u32) -> V3<f32>| InputBlendShapeData {
+            default_weight: 0.0,
+            name: name.to_owned(),
+            positions: (0..count).map(|v| (v, at(v).map(f))).filter(|(_, p)| !p.iter().all(|c| c.is_zero())).collect(),
+            normals: FxHashMap::default(),
+            tangents: FxHashMap::default(),
+        };
+        let shapes = [
+            shape("lift", &|_| V3::new(0.0, 1.0, 0.0)),
+            shape("slide", &|v| if v == 0 { V3::new(2.0, 0.0, 0.0) } else { V3::zeros() }),
+        ];
+        data.blend_shapes_container = Some(BlendShapesContainer::from_lists(&data.vertex_buffer, &shapes));
+        let unbent: Vec<f32> = {
+            let mut out = Vec::new();
+            for v in data.vertex_buffer.iter() {
+                let p = v.read_3_f32(VertexAttributeUsage::Position).unwrap();
+                out.extend([p.x, p.y, p.z]);
+            }
+            out
+        };
+        let surface = Surface::new(SurfaceResource::new_embedded(data));
+        let bend = Bend::read(&surface).expect("blend shapes read");
+        assert_eq!(bend.pose(&[0.0, 0.0]), unbent, "at no weight, unbent");
+        let bent = bend.pose(&[0.5, 0.25]);
+        for v in 0..count as usize {
+            let slide = if v == 0 { 0.5 } else { 0.0 };
+            assert_eq!(bent[v * 3], unbent[v * 3] + slide, "vertex {v} x");
+            assert_eq!(bent[v * 3 + 1], unbent[v * 3 + 1] + 0.5, "vertex {v} y");
+            assert_eq!(bent[v * 3 + 2], unbent[v * 3 + 2], "vertex {v} z");
+        }
     }
 
     #[test]
