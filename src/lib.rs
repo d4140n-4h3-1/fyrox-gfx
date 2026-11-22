@@ -112,6 +112,9 @@ pub struct GraphicsEffects {
     #[visit(skip)]
     #[reflect(hidden)]
     yoctite: Option<yoctite::Mode>,
+    /// Whether Candelite's surface view is laid over the frame: see [`Self::with_candelite_view`].
+    #[cfg(feature = "raytracing")]
+    candelite_view: bool,
     #[visit(skip)]
     #[reflect(hidden)]
     refraction: Option<Rc<RefCell<RefractionPass>>>,
@@ -192,6 +195,8 @@ impl Default for GraphicsEffects {
         Self {
             #[cfg(feature = "raytracing")]
             yoctite: None,
+            #[cfg(feature = "raytracing")]
+            candelite_view: false,
             refraction: None,
             soft_shadows: Some(SoftShadows::default()),
             anti_aliasing: Some(AntiAliasing::default()),
@@ -257,6 +262,17 @@ impl GraphicsEffects {
     #[cfg(feature = "raytracing")]
     pub fn with_yoctite(mut self) -> Self {
         self.yoctite = Some(yoctite::Mode::Render);
+        self
+    }
+
+    /// As [`Self::with_yoctite`], and with Candelite's surface view laid over the frame: what a
+    /// ray from the eye through each pixel finds on the meshes' cards, the first part of the
+    /// global illumination to come (see [`yoctite::YoctitePass::show_candelite`]). Magenta where a
+    /// ray hit something no card saw.
+    #[cfg(feature = "raytracing")]
+    pub fn with_candelite_view(mut self) -> Self {
+        self.yoctite = Some(yoctite::Mode::Render);
+        self.candelite_view = true;
         self
     }
 
@@ -465,7 +481,11 @@ impl Plugin for GraphicsEffects {
                     graphics_context.renderer.set_taken_over_meshes(Some(set.clone()));
                     set
                 });
-                let pass = Rc::new(RefCell::new(yoctite::YoctitePass::new(TypeId::of::<Self>(), mode, taken_over)));
+                let mut pass = yoctite::YoctitePass::new(TypeId::of::<Self>(), mode, taken_over);
+                if self.candelite_view {
+                    pass.show_candelite();
+                }
+                let pass = Rc::new(RefCell::new(pass));
                 graphics_context.renderer.add_render_pass(pass);
             }
         }

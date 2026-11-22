@@ -190,7 +190,7 @@ const MASK_LIMIT: u32 = 1024;
 
 /// The cutout masks made so far, by texture and the diffuse colour's alpha (see [`mask_key`]):
 /// [`None`] for a texture with every texel drawn, which is traced solid.
-type Masks = FxHashMap<u64, Option<Arc<CutoutMask>>>;
+pub(crate) type Masks = FxHashMap<u64, Option<Arc<CutoutMask>>>;
 
 /// The key a mask of `texture`, with diffuse alpha `alpha`, is kept under.
 fn mask_key(texture: u64, alpha: u8) -> u64 {
@@ -242,6 +242,15 @@ fn property<'a>(material: &'a fyrox::material::Material, name: &str) -> Option<&
 
 /// Whether a surface of `material` is a cutout, and the key of its mask in `masks` if so, making
 /// the mask if it has not been made: see [`Blocks::Cutout`]. Not while its texture is loading.
+/// The cutout mask of `material`'s diffuse texture - where the renderer's alpha test draws it -
+/// made once and kept in `masks`; [`None`] if it draws all of it, or it cannot be read.
+pub(crate) fn material_mask(material: &MaterialResource, masks: &mut Masks) -> Option<Arc<CutoutMask>> {
+    let material = material.state();
+    let material = material.data_ref()?;
+    let key = cutout(&material, masks)?;
+    masks.get(&key).cloned().flatten()
+}
+
 fn cutout(material: &fyrox::material::Material, masks: &mut Masks) -> Option<u64> {
     let texture = material.texture_ref("diffuseTexture")?.value.clone()?;
     let alpha = match property(material, "diffuseColor") {
@@ -263,7 +272,7 @@ fn cutout(material: &fyrox::material::Material, masks: &mut Masks) -> Option<u64
 /// The texture coordinates of `surface`'s first `count` vertices, two floats each, as the
 /// renderer samples its diffuse texture with: scaled by `material`'s `texCoordScale`, if it has
 /// one.
-fn texture_coordinates(surface: &Surface, count: usize) -> Vec<f32> {
+pub(crate) fn texture_coordinates(surface: &Surface, count: usize) -> Vec<f32> {
     let scale = surface
         .material()
         .state()

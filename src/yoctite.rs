@@ -22,6 +22,11 @@
 //! instances whenever they change - a forest swaying in the wind, at every level of detail. Their
 //! bounds are grown by as far as weights of up to [`MOST_WEIGHT`] can move them.
 //!
+//! With Candelite's surface view ([`YoctitePass::show_candelite`]), each mesh it uploads is also
+//! given Candelite's cards, captured into its surface cache, and its triangles to trace against
+//! (`fyrox_graphics_wgpu::candelite`); and over the frame is laid what a ray from the eye through
+//! each pixel finds on the cards - magenta where it hit something no card saw.
+//!
 //! [`Mode::View`] instead lays the clusters over the frame, each in a colour of its own: to see
 //! them, and which levels of detail are drawn. It can choose them on the CPU (`yoctite::select`)
 //! as well, the reference the GPU's choice is held to.
@@ -38,7 +43,10 @@ use fyrox::{
     graph::SceneGraph,
     graphics::{
         error::FrameworkError, gpu_program::SamplerFallback, gpu_program::ShaderPropertyKind,
-        gpu_program::ShaderResourceKind, gpu_texture::GpuTexture, sampler::GpuSampler, stats::RenderPassStatistics,
+        gpu_program::ShaderResourceKind,
+        gpu_texture::{GpuTexture, GpuTextureDescriptor, GpuTextureKind, PixelKind},
+        server::GraphicsServer,
+        sampler::GpuSampler, stats::RenderPassStatistics,
     },
     material::{shader::Shader, Material, MaterialProperty, MaterialResource},
     renderer::{
@@ -62,8 +70,11 @@ use fyrox::{
     },
 };
 use fyrox_graphics_wgpu::{
+    candelite::{self, Bounds, SurfaceCache, SurfaceView, TraceScene, ViewShows},
     server::WgpuGraphicsServer,
+    texture::WgpuTexture,
     yoctite::{
+        resolve_materials, Capture,
         ClusterView, CullParameters, Culler, GBufferDrawer, GeometryPool, InstanceId, MaterialParams, MeshId,
         Morphs, PoolVertex, YoctiteMaterial,
     },
@@ -344,10 +355,28 @@ struct SceneMeshes {
     /// The mesh nodes placed, which the renderer leaves out of its own draw.
     taken_over: FxHashSet<Handle<Node>>,
     materials: Materials,
+    /// Candelite, if it is shown: see [`YoctitePass::show_candelite`].
+    candelite: Option<Candelite>,
     /// How many times the scene has been drawn.
     frame: u64,
     overflow_reported: bool,
 }
+
+/// A scene's Candelite: its surface cache, what it traces against, the captures waiting to be
+/// drawn into the cache, and its view.
+struct Candelite {
+    cache: SurfaceCache,
+    scene: TraceScene,
+    pending: Vec<Capture>,
+    view: Option<SurfaceView>,
+    target: Option<GpuTexture>,
+    full_reported: bool,
+    /// The cutout masks made so far, by texture: foliage is traced as a cutout.
+    masks: crate::raytraced_shadows::Masks,
+}
+
+/// How many texels square Candelite's atlas is.
+const ATLAS_SIZE: u32 = 2048;
 
 /// Yoctite in the renderer: see the module's description. [`crate::GraphicsEffects::with_yoctite`]
 /// and [`crate::GraphicsEffects::with_yoctite_view`] add it.
@@ -362,6 +391,8 @@ pub struct YoctitePass {
     builder: Option<Builder>,
     scenes: FxHashMap<Handle<Scene>, SceneMeshes>,
     failed: bool,
+    /// Whether Candelite's surface view is laid over the frame.
+    candelite: bool,
 }
 
 impl YoctitePass {
@@ -377,7 +408,15 @@ impl YoctitePass {
             builder: None,
             scenes: Default::default(),
             failed: false,
+            candelite: false,
         }
+    }
+
+    /// Gives each mesh drawn Candelite's cards and triangles to trace, and lays over the frame
+    /// what a ray from the eye finds on the cards (see the module's description). Only drawing in
+    /// place of the renderer, and where rays can be traced.
+    pub fn show_candelite(&mut self) {
+        self.candelite = true;
     }
 }
 
@@ -642,16 +681,28 @@ impl SceneMeshes {
     /// each with its material's slot; those still building are left to the renderer. Surfaces are
     /// built by `builder`, once for every scene. Whether the mesh nodes placed
     /// ([`Self::taken_over`]) changed.
-    fn sync(&mut self, server: &WgpuGraphicsServer, graph: &Graph, mode: Mode, builder: &mut Builder) -> bool {
+    fn sync(&mut self, server: &WgpuGraphicsServer, graph: &Graph, mode: Mode, builder: &mut Builder, candelite: bool) -> bool {
         let device = &server.state.device;
         let queue = &server.state.queue;
         let rendering = mode == Mode::Render;
+        if candelite && rendering && self.candelite.is_none() && candelite::can_trace(device) {
+            self.candelite = Some(Candelite {
+                cache: SurfaceCache::new(device, ATLAS_SIZE),
+                scene: TraceScene::new(),
+                pending: Vec::new(),
+                view: SurfaceView::new(device),
+                target: None,
+                full_reported: false,
+                masks: Default::default(),
+            });
+        }
         let Self {
             pool,
             built,
             nodes,
             taken_over,
             materials,
+            candelite,
             frame,
             ..
         } = self;
@@ -750,11 +801,19 @@ impl SceneMeshes {
             }
             for (n, surface) in surfaces.iter().enumerate() {
                 let data = surface.data().key();
+                // A mesh uploaded now, for Candelite: its triangles and full-detail clusters.
+                let mut fresh = None;
                 let mesh = match built.entry(data) {
                     Entry::Occupied(built) => built.get().mesh,
                     Entry::Vacant(place) => {
                         let dag = builder.dag(surface).expect("built, as checked above");
-                        let (mut vertices, _) = read_surface(surface);
+                        let (mut vertices, indices) = read_surface(surface);
+                        if candelite.is_some() {
+                            let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+                            let full: Vec<usize> =
+                                (0..dag.clusters.len()).filter(|&i| dag.clusters[i].level == 0).collect();
+                            fresh = Some((positions, indices, full));
+                        }
                         let morphs = read_morphs(surface, vertices.len());
                         // With the vertices its coarser levels made: grown foliage cards'
                         // corners, which bend as the vertices they copy do.
@@ -784,6 +843,34 @@ impl SceneMeshes {
                 } else {
                     (0, 0)
                 };
+                if let (Some(candelite), Some((positions, indices, full))) = (candelite.as_mut(), fresh) {
+                    // Foliage traced as a cutout: a ray passes where its texture is see-through.
+                    let cutout = crate::raytraced_shadows::material_mask(surface.material(), &mut candelite.masks).map(|mask| {
+                        let uvs: Vec<[f32; 2]> = crate::raytraced_shadows::texture_coordinates(surface, positions.len())
+                            .chunks_exact(2)
+                            .map(|uv| [uv[0], uv[1]])
+                            .collect();
+                        (uvs, mask)
+                    });
+                    candelite.scene.add_mesh(
+                        device,
+                        queue,
+                        mesh,
+                        &positions,
+                        &indices,
+                        cutout.as_ref().map(|(uvs, mask)| (uvs.as_slice(), mask.clone())),
+                    );
+                    let first = pool.mesh(mesh).map_or(0, |m| m.first_cluster);
+                    let clusters: Vec<u32> = full.iter().map(|&i| first + i as u32).collect();
+                    match candelite.cache.add_mesh(mesh, &Bounds::of(positions), &clusters, slot) {
+                        Some(captures) => candelite.pending.extend(captures),
+                        None if !candelite.full_reported => {
+                            Log::warn("Candelite: its atlas is full; meshes past it have no cards");
+                            candelite.full_reported = true;
+                        }
+                        None => {}
+                    }
+                }
                 let instance = pool.add_instance(device, queue, mesh, rows(&transform), slot);
                 drawn.weights = mesh_weights(node);
                 pool.set_weights(instance, &drawn.weights);
@@ -814,6 +901,11 @@ impl SceneMeshes {
                 let keep = used.contains(data);
                 if !keep {
                     pool.remove_mesh(queue, built.mesh);
+                    if let Some(candelite) = candelite.as_mut() {
+                        candelite.cache.remove_mesh(built.mesh);
+                        candelite.scene.remove_mesh(built.mesh);
+                        candelite.pending.retain(|capture| capture.mesh != built.mesh);
+                    }
                 }
                 keep
             });
@@ -891,6 +983,102 @@ fn choose(
     (list, triangles)
 }
 
+impl YoctitePass {
+    /// Lays Candelite's surface view over the frame, if it is shown (see
+    /// [`Self::show_candelite`]).
+    fn candelite_view(&mut self, ctx: SceneRenderPassContext) -> Result<RenderPassStatistics, FrameworkError> {
+        if !self.candelite || self.failed {
+            return Ok(Default::default());
+        }
+        let Some(server) = ctx.server.as_any().downcast_ref::<WgpuGraphicsServer>() else {
+            return Ok(Default::default());
+        };
+        let Some(scene) = self.scenes.get_mut(&ctx.scene_handle) else {
+            return Ok(Default::default());
+        };
+        let (Some(candelite), Some(pool)) = (scene.candelite.as_mut(), scene.pool.as_ref()) else {
+            return Ok(Default::default());
+        };
+        let device = &server.state.device;
+        let Some(view) = candelite.view.as_ref() else {
+            return Ok(Default::default());
+        };
+        let viewport = ctx.observer.viewport;
+        let (width, height) = (viewport.w().max(1) as usize, viewport.h().max(1) as usize);
+        let matches = candelite.target.as_ref().is_some_and(|t| {
+            matches!(t.kind(), GpuTextureKind::Rectangle { width: w, height: h } if w == width && h == height)
+        });
+        if !matches {
+            candelite.target = Some(server.create_texture(GpuTextureDescriptor {
+                name: "CandeliteView",
+                kind: GpuTextureKind::Rectangle { width, height },
+                pixel_kind: PixelKind::RGBA8,
+                ..Default::default()
+            })?);
+        }
+        let drawn = candelite.target.clone().expect("made above");
+        let Some(target) = drawn.as_any().downcast_ref::<WgpuTexture>() else {
+            return Ok(Default::default());
+        };
+        let position = &ctx.observer.position;
+        let Some(inverse) = position.view_projection_matrix.try_inverse() else {
+            return Ok(Default::default());
+        };
+        let mut inverse_columns = [[0.0f32; 4]; 4];
+        for (column, values) in inverse.column_iter().zip(inverse_columns.iter_mut()) {
+            values.copy_from_slice(column.as_slice());
+        }
+        server.flush_active_pass();
+        let mut encoder = server.frame_encoder.borrow_mut().take().unwrap_or_else(|| {
+            device.create_command_encoder(&Default::default())
+        });
+        view.record(
+            device,
+            &mut encoder,
+            &mut candelite.scene,
+            pool,
+            &mut candelite.cache,
+            inverse_columns,
+            position.translation.into(),
+            ViewShows::Shaded,
+            target.wgpu_texture(),
+        );
+        *server.frame_encoder.borrow_mut() = Some(encoder);
+
+        if self.shader.is_none() {
+            let shader = Shader::from_string(WGSL)
+                .map_err(|e| FrameworkError::Custom(format!("Yoctite view shader: {e:?}")))?;
+            self.shader = Some(RenderPassContainer::new(ctx.server, &shader)?);
+        }
+        let size = Vector2::new(viewport.w() as f32, viewport.h() as f32);
+        let world_view_projection = make_viewport_matrix(viewport);
+        let properties = PropertyGroup::from([
+            property("worldViewProjection", &world_view_projection),
+            property("screenSize", &size),
+        ]);
+        let material = RenderMaterial::from([
+            binding("clusters", (&drawn, &ctx.renderer_resources.nearest_clamp_sampler)),
+            binding("properties", &properties),
+        ]);
+        let shader = self.shader.as_ref().expect("made above");
+        let mut stats = RenderPassStatistics::default();
+        stats += shader.run_pass(
+            1,
+            &ImmutableString::new("Primary"),
+            ctx.framebuffer,
+            &ctx.renderer_resources.quad,
+            viewport,
+            &material,
+            ctx.uniform_buffer_cache,
+            Default::default(),
+            None,
+        )?;
+        // And the rays' own draw.
+        stats.draw_calls += 1;
+        Ok(stats)
+    }
+}
+
 impl SceneRenderPass for YoctitePass {
     fn on_gbuffer_render(&mut self, mut ctx: GBufferPassContext) -> Result<RenderPassStatistics, FrameworkError> {
         if self.failed || self.mode != Mode::Render {
@@ -904,7 +1092,7 @@ impl SceneRenderPass for YoctitePass {
         builder.collect();
         let scene = self.scenes.entry(ctx.scene_handle).or_default();
         let meshes = scene.built.len();
-        let changed = scene.sync(server, &ctx.scene.graph, self.mode, builder);
+        let changed = scene.sync(server, &ctx.scene.graph, self.mode, builder, self.candelite);
         // From the next frame on the renderer leaves these out: this one, it drew them already,
         // which drawing them again changes nothing of.
         if let (true, Some(taken_over)) = (changed, &self.taken_over) {
@@ -945,6 +1133,24 @@ impl SceneRenderPass for YoctitePass {
                 return Ok(Default::default());
             }
         };
+        // Candelite's new captures, into its cache; and what it traces against, kept in step.
+        if let Some(candelite) = scene.candelite.as_mut() {
+            server.flush_active_pass();
+            let mut encoder = server.frame_encoder.borrow_mut().take().unwrap_or_else(|| {
+                device.create_command_encoder(&Default::default())
+            });
+            if !candelite.pending.is_empty() {
+                let captured = resolve_materials(&materials).and_then(|resolved| {
+                    candelite.cache.record(device, &mut encoder, drawer, pool, &candelite.pending, &resolved)
+                });
+                if let Err(err) = captured {
+                    Log::err(format!("Candelite could not capture its cards: {err:?}"));
+                }
+                candelite.pending.clear();
+            }
+            candelite.scene.update(device, &mut encoder, pool);
+            *server.frame_encoder.borrow_mut() = Some(encoder);
+        }
         let drew = started.elapsed().as_secs_f64();
         let (clusters, triangles) = scene.chosen("").unwrap_or_default();
         if scene.frame % STATS_EVERY == 1 {
@@ -973,7 +1179,7 @@ impl SceneRenderPass for YoctitePass {
 
     fn on_hdr_render(&mut self, ctx: SceneRenderPassContext) -> Result<RenderPassStatistics, FrameworkError> {
         let Mode::View { on_gpu } = self.mode else {
-            return Ok(Default::default());
+            return self.candelite_view(ctx);
         };
         if self.failed {
             return Ok(Default::default());
@@ -991,7 +1197,7 @@ impl SceneRenderPass for YoctitePass {
         builder.collect();
         let scene = self.scenes.entry(ctx.scene_handle).or_default();
         let meshes = scene.built.len();
-        scene.sync(server, &ctx.scene.graph, self.mode, builder);
+        scene.sync(server, &ctx.scene.graph, self.mode, builder, false);
         if scene.built.len() < meshes {
             builder.forget_unused(self.scenes.values());
         }
