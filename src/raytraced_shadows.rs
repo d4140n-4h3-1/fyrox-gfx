@@ -84,7 +84,7 @@ use fyrox::{
     },
     scene::{
         camera::Camera,
-        graph::Graph,
+        graph::{Graph, NodeChange},
         mesh::{
             surface::Surface,
             buffer::{VertexAttributeUsage, VertexReadTrait},
@@ -760,9 +760,8 @@ pub struct TracedLightShadows {
     skins: FxHashMap<u64, Skin>,
     poses: FxHashMap<Shape, Vec<Matrix4<f32>>>,
     /// Each surface with blend shapes, read once, by its data (or [`None`], if it has none to
-    /// read); and the weights each bent surface was last bent by.
+    /// read). The weights each was last bent by are kept with its node (see [`Contrib`]).
     bends: FxHashMap<u64, Option<Bend>>,
-    bent: FxHashMap<Shape, Vec<f32>>,
     /// Each surface with blend shapes on the GPU, by its data, and what bends copies of it.
     morphs: FxHashMap<u64, Option<RayTracedMorph>>,
     poser: Option<RayTracedPoser>,
@@ -800,6 +799,8 @@ struct Contrib {
     position: Vector3<f32>,
     reaches: Vec<f32>,
     class: usize,
+    /// The weights each of its bent surfaces' shadow geometry was last bent by, by surface.
+    bent: Vec<(usize, Vec<f32>)>,
 }
 
 /// How many of a bending mesh's surfaces show their bend from `distance` meters, given each one's
@@ -864,7 +865,6 @@ impl TracedLightShadows {
             skins: Default::default(),
             poses: Default::default(),
             bends: Default::default(),
-            bent: Default::default(),
             morphs: Default::default(),
             poser: None,
             corners: Default::default(),
@@ -918,7 +918,6 @@ impl LightShadowTracer for TracedLightShadows {
             self.skins.clear();
             self.poses.clear();
             self.bends.clear();
-            self.bent.clear();
             self.morphs.clear();
             self.corners.clear();
             self.masks.clear();
@@ -967,7 +966,19 @@ impl LightShadowTracer for TracedLightShadows {
                 visit.extend(graph.pair_iter().map(|(handle, _)| handle));
             }
             Some(changes) => {
-                let mut set: FxHashSet<Handle<Node>> = changes.iter().copied().collect();
+                // A change only to a node's weights matters only where its bend shows; elsewhere
+                // - most of the swaying forest - it is passed over.
+                let kinds = graph.change_kinds_since(self.journal.unwrap_or(0)).unwrap_or(&[]);
+                let mut set: FxHashSet<Handle<Node>> = FxHashSet::default();
+                for (i, &node) in changes.iter().enumerate() {
+                    if kinds.get(i) == Some(&NodeChange::Weights) {
+                        let kept = self.contribs.get(node.index() as usize).and_then(Option::as_ref);
+                        if kept.is_some_and(|c| c.handle == node && c.class == 0) {
+                            continue;
+                        }
+                    }
+                    set.insert(node);
+                }
                 set.extend(self.revisit.drain());
                 for contrib in self.contribs.iter().flatten() {
                     if !contrib.reaches.is_empty() {
@@ -994,13 +1005,18 @@ impl LightShadowTracer for TracedLightShadows {
             if slot >= self.contribs.len() {
                 self.contribs.resize_with(slot + 1, || None);
             }
-            // What was kept for this slot goes, if it was this node's or a node's now gone.
+            // What was kept for this slot goes, if it was this node's or a node's now gone; the
+            // weights its surfaces were last bent by stay with it.
+            let mut carried: Vec<(usize, Vec<f32>)> = Vec::new();
             if self.contribs[slot]
                 .as_ref()
                 .is_some_and(|c| c.handle == handle || graph.try_get_node(c.handle).is_err())
             {
                 if let Some(old) = self.contribs[slot].take() {
                     self.bend_wanted.remove(&old.handle);
+                    if old.handle == handle {
+                        carried = old.bent;
+                    }
                 }
             }
             let Ok(node) = graph.try_get_node(handle) else {
@@ -1050,6 +1066,7 @@ impl LightShadowTracer for TracedLightShadows {
                 position: node.global_position(),
                 reaches: Vec::new(),
                 class: 0,
+                bent: carried,
             };
             let mut wanted: Vec<BendJob> = Vec::new();
             // Whether to look at it again next frame whatever happens: posed every frame near the
@@ -1116,7 +1133,7 @@ impl LightShadowTracer for TracedLightShadows {
                 if surface.bones().is_empty() && has_morph {
                     // Built unbent the first time, then bent on the GPU once it has moved enough to show.
                     let shape = Shape::Posed(handle, n);
-                    let last = self.bent.get(&shape).map(Vec::as_slice);
+                    let last = out.bent.iter().find(|(m, _)| *m == n).map(|(_, w)| w.as_slice());
                     if let Some(Some(bend)) = self.bends.get(&key) {
                         let drift = bend.drift(last, &weights) * scale;
                         if drift >= BEND_LEAST.max(distance * BEND_LEAST_PER_METER) {
@@ -1287,6 +1304,14 @@ impl LightShadowTracer for TracedLightShadows {
                 _ => server.build_ray_traced_geometry(&vertices, &indices, updatable)?,
             };
             if let Some(geometry) = geometry {
+                // Built afresh, unbent: bent again from nothing.
+                if let Shape::Posed(node, n) = shape {
+                    if let Some(Some(contrib)) = self.contribs.get_mut(node.index() as usize) {
+                        if contrib.handle == node {
+                            contrib.bent.retain(|(m, _)| *m != n);
+                        }
+                    }
+                }
                 self.geometry.insert(shape, geometry);
                 built += 1;
             }
@@ -1299,7 +1324,6 @@ impl LightShadowTracer for TracedLightShadows {
             // afresh.
             let geometry = &self.geometry;
             self.poses.retain(|shape, _| geometry.contains_key(shape));
-            self.bent.retain(|shape, _| geometry.contains_key(shape));
         }
 
         // Bent geometry, bent on the GPU and refitted.
@@ -1318,8 +1342,16 @@ impl LightShadowTracer for TracedLightShadows {
         poser.pose(server, &bends)?;
         let bent_any = !bends.is_empty();
         for (shape, _, weights, _) in bend_jobs {
-            // Bent: no longer wanted, until its weights change again.
-            if let Shape::Posed(node, _) = shape {
+            // Bent: no longer wanted, until its weights change again; and bent by these.
+            if let Shape::Posed(node, n) = shape {
+                if let Some(Some(contrib)) = self.contribs.get_mut(node.index() as usize) {
+                    if contrib.handle == node {
+                        match contrib.bent.iter_mut().find(|(m, _)| *m == n) {
+                            Some((_, was)) => was.clone_from(&weights),
+                            None => contrib.bent.push((n, weights.clone())),
+                        }
+                    }
+                }
                 if let Some(wanted) = self.bend_wanted.get_mut(&node) {
                     wanted.retain(|job| job.0 != shape);
                     if wanted.is_empty() {
@@ -1327,7 +1359,6 @@ impl LightShadowTracer for TracedLightShadows {
                     }
                 }
             }
-            self.bent.insert(shape, weights);
         }
         if !same {
             let kept: Vec<&RayTracedGeometry> = self.geometry.values().collect();
