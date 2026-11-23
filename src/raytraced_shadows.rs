@@ -397,10 +397,18 @@ pub const BEND_NEW_PER_FRAME: usize = 16;
 /// last bent before it is bent again: less than a soft shadow shows.
 pub const BEND_LEAST: f32 = 0.01;
 
+/// And further off, how far for each meter between it and the camera, if more: a shadow's edge
+/// moving shows by the angle it moves through - a centimetre near by is a few pixels, forty
+/// metres off a fraction of one - and a leaf a few metres over the ground already casts an edge
+/// some centimetres soft. Bending every plant in reach by the centimetre kept 480 refits a frame
+/// going in Wilderness's forest; with this, 200.
+pub const BEND_LEAST_PER_METER: f32 = 0.005;
+
 /// The most bent meshes' geometry bent again in a frame: each is refitted, which costs the CPU a
 /// few microseconds in wgpu, and a forest holds thousands within reach. Those that have moved the
-/// furthest go first; the rest wait, their drift growing, until it is their turn.
-pub const BEND_BUDGET: usize = 512;
+/// furthest as the camera sees it go first - the nearest, mostly; the rest wait, their drift
+/// growing, until it is their turn.
+pub const BEND_BUDGET: usize = 256;
 
 
 /// A surface with blend shapes as its data has it, read once: where its vertices are in its own
@@ -778,7 +786,7 @@ pub struct TracedLightShadows {
 }
 
 /// Bent geometry to bend: which, whose blend shapes (by surface data), by what, and how far it
-/// has moved, in meters, since it was last bent.
+/// has moved since it was last bent, as seen from the camera (meters over meters away).
 type BendJob = (Shape, u64, Vec<f32>, f32);
 
 /// What a mesh node gave the scene traced when last looked at: its surfaces placed and those put
@@ -1111,8 +1119,9 @@ impl LightShadowTracer for TracedLightShadows {
                     let last = self.bent.get(&shape).map(Vec::as_slice);
                     if let Some(Some(bend)) = self.bends.get(&key) {
                         let drift = bend.drift(last, &weights) * scale;
-                        if drift >= BEND_LEAST {
-                            wanted.push((shape, key, weights.clone(), drift));
+                        if drift >= BEND_LEAST.max(distance * BEND_LEAST_PER_METER) {
+                            // Ranked by the angle it has moved through: the nearest first.
+                            wanted.push((shape, key, weights.clone(), drift / distance.max(1.0)));
                         }
                     }
                     out.placed.push((shape, instance_transform(&transform), handle, n, how));
