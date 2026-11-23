@@ -115,6 +115,10 @@ pub struct GraphicsEffects {
     /// Whether Candelite's surface view is laid over the frame: see [`Self::with_candelite_view`].
     #[cfg(feature = "raytracing")]
     candelite_view: bool,
+    /// Whether that view shows the light Candelite lights the cards with: see
+    /// [`Self::with_candelite_light_view`].
+    #[cfg(feature = "raytracing")]
+    candelite_light: bool,
     #[visit(skip)]
     #[reflect(hidden)]
     refraction: Option<Rc<RefCell<RefractionPass>>>,
@@ -197,6 +201,8 @@ impl Default for GraphicsEffects {
             yoctite: None,
             #[cfg(feature = "raytracing")]
             candelite_view: false,
+            #[cfg(feature = "raytracing")]
+            candelite_light: false,
             refraction: None,
             soft_shadows: Some(SoftShadows::default()),
             anti_aliasing: Some(AntiAliasing::default()),
@@ -273,6 +279,17 @@ impl GraphicsEffects {
     pub fn with_candelite_view(mut self) -> Self {
         self.yoctite = Some(yoctite::Mode::Render);
         self.candelite_view = true;
+        self
+    }
+
+    /// As [`Self::with_candelite_view`], but the cards are lit - the sun with traced shadows,
+    /// and the light between surfaces, bounce after bounce - and the view shows the light leaving
+    /// what each ray from the eye hit (see [`yoctite::YoctitePass::show_candelite_light`]).
+    #[cfg(feature = "raytracing")]
+    pub fn with_candelite_light_view(mut self) -> Self {
+        self.yoctite = Some(yoctite::Mode::Render);
+        self.candelite_view = true;
+        self.candelite_light = true;
         self
     }
 
@@ -482,7 +499,9 @@ impl Plugin for GraphicsEffects {
                     set
                 });
                 let mut pass = yoctite::YoctitePass::new(TypeId::of::<Self>(), mode, taken_over);
-                if self.candelite_view {
+                if self.candelite_light {
+                    pass.show_candelite_light();
+                } else if self.candelite_view {
                     pass.show_candelite();
                 }
                 let pass = Rc::new(RefCell::new(pass));

@@ -65,12 +65,13 @@ use fyrox::{
             surface::Surface,
             Mesh, RenderPath,
         },
+        light::{directional::DirectionalLight, BaseLight},
         node::Node,
         Scene,
     },
 };
 use fyrox_graphics_wgpu::{
-    candelite::{self, Bounds, SurfaceCache, SurfaceView, TraceScene, ViewShows},
+    candelite::{self, Bounds, SurfaceCache, SurfaceLight, SurfaceView, Sunlight, TraceScene, ViewShows},
     server::WgpuGraphicsServer,
     texture::WgpuTexture,
     yoctite::{
@@ -369,6 +370,8 @@ struct Candelite {
     scene: TraceScene,
     pending: Vec<Capture>,
     view: Option<SurfaceView>,
+    /// The light on the cards: see `fyrox_graphics_wgpu::candelite::SurfaceLight`.
+    light: Option<SurfaceLight>,
     target: Option<GpuTexture>,
     full_reported: bool,
     /// The cutout masks made so far, by texture: foliage is traced as a cutout.
@@ -391,8 +394,9 @@ pub struct YoctitePass {
     builder: Option<Builder>,
     scenes: FxHashMap<Handle<Scene>, SceneMeshes>,
     failed: bool,
-    /// Whether Candelite's surface view is laid over the frame.
+    /// Whether Candelite's surface view is laid over the frame, and what it shows.
     candelite: bool,
+    candelite_shows: ViewShows,
 }
 
 impl YoctitePass {
@@ -409,6 +413,7 @@ impl YoctitePass {
             scenes: Default::default(),
             failed: false,
             candelite: false,
+            candelite_shows: ViewShows::Shaded,
         }
     }
 
@@ -417,6 +422,14 @@ impl YoctitePass {
     /// place of the renderer, and where rays can be traced.
     pub fn show_candelite(&mut self) {
         self.candelite = true;
+    }
+
+    /// As [`Self::show_candelite`], and lights the cards - the sun with traced shadows, and the
+    /// light between surfaces - laying over the frame the light leaving what each ray from the eye
+    /// hit: Candelite's global illumination as its rays see it.
+    pub fn show_candelite_light(&mut self) {
+        self.candelite = true;
+        self.candelite_shows = ViewShows::Lit;
     }
 }
 
@@ -691,6 +704,7 @@ impl SceneMeshes {
                 scene: TraceScene::new(),
                 pending: Vec::new(),
                 view: SurfaceView::new(device),
+                light: SurfaceLight::new(device),
                 target: None,
                 full_reported: false,
                 masks: Default::default(),
@@ -1028,19 +1042,54 @@ impl YoctitePass {
         for (column, values) in inverse.column_iter().zip(inverse_columns.iter_mut()) {
             values.copy_from_slice(column.as_slice());
         }
+        // The sun: the scene's first directional light, its up vector towards the sun as the
+        // renderer lights with it; and the sky, its ambient light.
+        let sun = ctx.scene.graph.linear_iter().find_map(|node| node.cast::<DirectionalLight>());
+        let colour = |c: fyrox::core::color::Color| [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0];
+        let sky = colour(ctx.scene.rendering_options.ambient_lighting_color);
+        let sunlight = match sun {
+            Some(sun) => {
+                let base: &BaseLight = sun.base_light_ref();
+                let toward = sun.up_vector().try_normalize(f32::EPSILON).unwrap_or_else(Vector3::y);
+                Sunlight {
+                    toward_sun: toward.into(),
+                    sun: colour(base.color()).map(|c| c * base.intensity()),
+                    sky,
+                }
+            }
+            None => Sunlight {
+                toward_sun: [0.0, 1.0, 0.0],
+                sun: [0.0; 3],
+                sky,
+            },
+        };
+        let eye: [f32; 3] = position.translation.into();
         server.flush_active_pass();
         let mut encoder = server.frame_encoder.borrow_mut().take().unwrap_or_else(|| {
             device.create_command_encoder(&Default::default())
         });
+        let Some(light) = candelite.light.as_mut() else {
+            *server.frame_encoder.borrow_mut() = Some(encoder);
+            return Ok(Default::default());
+        };
+        if self.candelite_shows == ViewShows::Lit {
+            light.update(device, &mut encoder, &mut candelite.scene, pool, &mut candelite.cache, eye, &sunlight);
+            if light.is_full() && !candelite.full_reported {
+                Log::warn("Candelite: its radiance atlas is full; instances past it are lit where rays hit them");
+                candelite.full_reported = true;
+            }
+        }
         view.record(
             device,
             &mut encoder,
             &mut candelite.scene,
             pool,
             &mut candelite.cache,
+            light,
+            &sunlight,
             inverse_columns,
-            position.translation.into(),
-            ViewShows::Shaded,
+            eye,
+            self.candelite_shows,
             target.wgpu_texture(),
         );
         *server.frame_encoder.borrow_mut() = Some(encoder);
