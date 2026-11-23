@@ -396,6 +396,18 @@ struct Candelite {
     masks: crate::raytraced_shadows::Masks,
 }
 
+/// About how long lighting Candelite's cards may take on the GPU a frame, in milliseconds: its
+/// budget of texels is steered towards it.
+const CARDS_LIT_MS: f32 = 2.5;
+/// The fewest texels Candelite's cards are lit a frame, however long they take: new cards still
+/// come in.
+const CARDS_LIT_LEAST: u32 = 8192;
+
+/// About how long tracing Candelite's radiance cache may take on the GPU a frame, in milliseconds.
+const CACHE_MS: f32 = 1.0;
+/// The fewest probes of Candelite's radiance cache traced a frame.
+const CACHE_LEAST: usize = 32;
+
 /// How many texels square Candelite's atlas is.
 const ATLAS_SIZE: u32 = 2048;
 
@@ -1502,6 +1514,19 @@ fn gather(
     let eye: [f32; 3] = position.translation.into();
     // Timed apart, as GPU marks: the cards lit, the radiance cache, the screen probes.
     server.gpu_mark_in(&mut encoder, "G-buffer: custom passes (Yoctite)");
+    // The cards' lighting kept near CARDS_LIT_MS of GPU time: its texels' rays cost ten times as
+    // much among crowns as over open ground, and walking into a wood with a fixed budget stalled
+    // frames. Steered from the latest frame timed (a frame or two behind), a quarter of the way a
+    // frame so as not to swing.
+    if let Some(ms) = server.gpu_latest("Candelite: cards lit") {
+        let scale = (CARDS_LIT_MS / ms.max(0.05)).powf(0.25).clamp(0.7, 1.1);
+        light.set_budget(((light.budget() as f32 * scale) as u32).max(CARDS_LIT_LEAST));
+    }
+    // The radiance cache likewise: the grids stepping a cell hand it a slab of new probes at once.
+    if let Some(ms) = server.gpu_latest("Candelite: radiance cache") {
+        let scale = (CACHE_MS / ms.max(0.05)).powf(0.25).clamp(0.7, 1.1);
+        radiance.set_budget(((radiance.budget() as f32 * scale) as usize).max(CACHE_LEAST));
+    }
     light.update(device, &mut encoder, &mut candelite.scene, pool, &mut candelite.cache, eye, &sunlight);
     server.gpu_mark_in(&mut encoder, "Candelite: cards lit");
     radiance.update(device, &mut encoder, &mut candelite.scene, pool, &mut candelite.cache, light, eye, &sunlight);
