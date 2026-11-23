@@ -764,7 +764,62 @@ pub struct TracedLightShadows {
     /// The cutout masks made so far, kept for as long as the scene is traced.
     masks: Masks,
     unsupported_reported: bool,
+    /// How far into the graph's change journal it has looked (see
+    /// `fyrox::scene::graph::Graph::changes_since`); [`None`] before its first look.
+    journal: Option<u64>,
+    /// What each mesh node gave the scene traced when last looked at, by its slot in the graph.
+    contribs: Vec<Option<Contrib>>,
+    /// Nodes to look at again next frame whatever the journal says (see `prepare`).
+    revisit: FxHashSet<Handle<Node>>,
+    /// Bent geometry wanting bending, by node, until the budget gets to it.
+    bend_wanted: FxHashMap<Handle<Node>, Vec<BendJob>>,
+    /// Where the look over a slice of every node a frame has got to (see [`SWEEP`]).
+    sweep: u32,
 }
+
+/// Bent geometry to bend: which, whose blend shapes (by surface data), by what, and how far it
+/// has moved, in meters, since it was last bent.
+type BendJob = (Shape, u64, Vec<f32>, f32);
+
+/// What a mesh node gave the scene traced when last looked at: its surfaces placed and those put
+/// in with the still meshes; and, for one that bends, where it was and how far off each of its
+/// surfaces' bends shows (its sway times its scale), and how many showed - to look at it again
+/// when the camera crosses one of those distances.
+struct Contrib {
+    handle: Handle<Node>,
+    placed: Vec<Placed>,
+    fixed: Vec<Fixed>,
+    position: Vector3<f32>,
+    reaches: Vec<f32>,
+    class: usize,
+}
+
+/// How many of a bending mesh's surfaces show their bend from `distance` meters, given each one's
+/// sway times its scale: as `prepare` decides it.
+fn bend_class(reaches: &[f32], distance: f32) -> usize {
+    if distance >= BEND_REACH {
+        return 0;
+    }
+    reaches.iter().filter(|&&reach| reach >= distance * BEND_SHOWS).count()
+}
+
+/// Whether what `material` blocks is known for good: loaded, and its diffuse texture with it -
+/// else it is traced solid for now, and must be looked at again once they are.
+fn material_settled(material: &MaterialResource) -> bool {
+    let state = material.state();
+    let Some(material) = state.data_ref() else {
+        return false;
+    };
+    material
+        .texture_ref("diffuseTexture")
+        .and_then(|binding| binding.value.clone())
+        .is_none_or(|texture| texture.is_ok())
+}
+
+/// How many of the graph's node slots are looked at each frame besides those its change journal
+/// names: changes the journal does not record - made through reflection, say - are caught within
+/// a few seconds.
+const SWEEP: u32 = 256;
 
 impl std::fmt::Debug for TracedLightShadows {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -806,6 +861,11 @@ impl TracedLightShadows {
             poser: None,
             corners: Default::default(),
             masks: Default::default(),
+            journal: None,
+            contribs: Vec::new(),
+            revisit: Default::default(),
+            bend_wanted: Default::default(),
+            sweep: 0,
             unsupported_reported: false,
         }
     }
@@ -854,6 +914,10 @@ impl LightShadowTracer for TracedLightShadows {
             self.morphs.clear();
             self.corners.clear();
             self.masks.clear();
+            self.journal = None;
+            self.contribs.clear();
+            self.revisit.clear();
+            self.bend_wanted.clear();
             self.scene_handle = Some(scene_handle);
         }
         let graph = &scene.graph;
@@ -874,14 +938,69 @@ impl LightShadowTracer for TracedLightShadows {
         let mut posed: FxHashMap<Shape, Vec<f32>> = FxHashMap::default();
         // Bent geometry to bend this frame: which, whose blend shapes (by surface data), by what,
         // and how far it has moved, in meters, since it was last bent.
-        let mut bend_jobs: Vec<(Shape, u64, Vec<f32>, f32)> = Vec::new();
         let mut new_bent = 0;
         let mut what_blocks: FxHashMap<u64, Option<Blocks>> = FxHashMap::default();
         self.frame += 1;
         let frame = self.frame;
-        for (handle, node) in graph.pair_iter() {
-            let Some(mesh) = node.cast::<Mesh>() else {
+
+        // Which nodes to look at: every one, the first time or when the graph's change journal no
+        // longer reaches back to the last look; else those it names (moved, shown, hidden, bent,
+        // come or gone), those to look at again (see `revisit`), bending ones the camera has
+        // brought across where their bends show or stop showing, and a slice of every slot in
+        // turn - looking at every node every frame, most of them standing still, took
+        // milliseconds.
+        let journaled = self.journal.and_then(|cursor| graph.changes_since(cursor));
+        let mut visit: Vec<Handle<Node>> = Vec::new();
+        match journaled {
+            None => {
+                self.contribs.clear();
+                self.revisit.clear();
+                self.bend_wanted.clear();
+                visit.extend(graph.pair_iter().map(|(handle, _)| handle));
+            }
+            Some(changes) => {
+                let mut set: FxHashSet<Handle<Node>> = changes.iter().copied().collect();
+                set.extend(self.revisit.drain());
+                for contrib in self.contribs.iter().flatten() {
+                    if !contrib.reaches.is_empty() {
+                        let distance = camera.map_or(0.0, |camera| (contrib.position - camera).norm());
+                        if bend_class(&contrib.reaches, distance) != contrib.class {
+                            set.insert(contrib.handle);
+                        }
+                    }
+                }
+                let capacity = graph.capacity();
+                for _ in 0..SWEEP.min(capacity) {
+                    self.sweep = (self.sweep + 1) % capacity.max(1);
+                    let handle = graph.handle_from_index(self.sweep);
+                    if handle.is_some() {
+                        set.insert(handle);
+                    }
+                }
+                visit.extend(set);
+            }
+        }
+        self.journal = Some(graph.changes_end());
+        for handle in visit {
+            let slot = handle.index() as usize;
+            if slot >= self.contribs.len() {
+                self.contribs.resize_with(slot + 1, || None);
+            }
+            // What was kept for this slot goes, if it was this node's or a node's now gone.
+            if self.contribs[slot]
+                .as_ref()
+                .is_some_and(|c| c.handle == handle || graph.try_get_node(c.handle).is_err())
+            {
+                if let Some(old) = self.contribs[slot].take() {
+                    self.bend_wanted.remove(&old.handle);
+                }
+            }
+            let Ok(node) = graph.try_get_node(handle) else {
                 continue;
+            };
+            let contrib: Option<Contrib> = 'node: {
+            let Some(mesh) = node.cast::<Mesh>() else {
+                break 'node None;
             };
             let transform = node.global_transform();
             let slot = handle.index() as usize;
@@ -909,12 +1028,25 @@ impl LightShadowTracer for TracedLightShadows {
             // its cube together again, when it lies still a while and when it goes.
             let settled = !place.moved && frame - place.still_since >= SETTLE_FRAMES;
             if !node.cast_shadows() {
-                continue;
+                break 'node None;
             }
             let skinned = mesh.surfaces().iter().any(|s| !s.bones().is_empty());
             if (skinned || place.moved) && !node.global_visibility() {
-                continue;
+                // Hidden: looked at again when it is shown (which the journal records).
+                break 'node None;
             }
+            let mut out = Contrib {
+                handle,
+                placed: Vec::new(),
+                fixed: Vec::new(),
+                position: node.global_position(),
+                reaches: Vec::new(),
+                class: 0,
+            };
+            let mut wanted: Vec<BendJob> = Vec::new();
+            // Whether to look at it again next frame whatever happens: posed every frame near the
+            // camera; a material still loading; bent geometry not yet given its own; settling.
+            let mut again = skinned;
             // Bent by its blend shapes: its weights, 1 at full strength. A mesh with blend shapes
             // counts as bending even with them all at nothing - a tree too far off to sway, say -
             // so that its weights coming and going put no cube together again.
@@ -926,6 +1058,7 @@ impl LightShadowTracer for TracedLightShadows {
             let scale = (0..3).map(|c| transform.fixed_view::<3, 1>(0, c).norm()).fold(0.0, f32::max);
             for (n, surface) in mesh.surfaces().iter().enumerate() {
                 let material = surface.material();
+                again |= !material_settled(material);
                 let masks = &mut self.masks;
                 let Some(how) = *what_blocks
                     .entry(material.key())
@@ -934,6 +1067,18 @@ impl LightShadowTracer for TracedLightShadows {
                     continue;
                 };
                 let key = surface.data().key();
+                if bending {
+                    // How far off its bend shows, kept to tell when the camera crosses it.
+                    let reach = self
+                        .bends
+                        .entry(key)
+                        .or_insert_with(|| Bend::read(surface))
+                        .as_ref()
+                        .map(|bend| bend.sway * scale);
+                    if let Some(reach) = reach {
+                        out.reaches.push(reach);
+                    }
+                }
                 let shows = bend_near
                     && self
                         .bends
@@ -957,6 +1102,7 @@ impl LightShadowTracer for TracedLightShadows {
                 let has_morph = has_morph
                     && (self.geometry.contains_key(&Shape::Posed(handle, n)) || {
                         new_bent += 1;
+                        again |= new_bent > BEND_NEW_PER_FRAME;
                         new_bent <= BEND_NEW_PER_FRAME
                     });
                 if surface.bones().is_empty() && has_morph {
@@ -966,22 +1112,25 @@ impl LightShadowTracer for TracedLightShadows {
                     if let Some(Some(bend)) = self.bends.get(&key) {
                         let drift = bend.drift(last, &weights) * scale;
                         if drift >= BEND_LEAST {
-                            bend_jobs.push((shape, key, weights.clone(), drift));
+                            wanted.push((shape, key, weights.clone(), drift));
                         }
                     }
-                    placed.push((shape, instance_transform(&transform), handle, n, how));
+                    out.placed.push((shape, instance_transform(&transform), handle, n, how));
                     continue;
                 }
                 if surface.bones().is_empty() {
-                    if settled && !bending && !matches!(how, Blocks::Cutout(_)) {
+                    let batchable = !bending && !matches!(how, Blocks::Cutout(_));
+                    if settled && batchable {
                         // Where it was last taken to be, not exactly where it is: a drift too
                         // small to count as moving should not put its cube together again.
                         let at = instance_transform(&place.transform);
-                        fixed.push((BatchKey::new(&place.transform, how), (handle, n, at, surface.data().key())));
+                        out.fixed.push((BatchKey::new(&place.transform, how), (handle, n, at, surface.data().key())));
                         continue;
                     }
+                    // Still settling: looked at again until it has, to be put with the rest.
+                    again |= batchable && !place.moved;
                     let shape = Shape::Shared(surface.data().key(), how.into());
-                    placed.push((shape, instance_transform(&transform), handle, n, how));
+                    out.placed.push((shape, instance_transform(&transform), handle, n, how));
                 } else {
                     let shape = Shape::Posed(handle, n);
                     // Posed afresh near the camera, or for the first time; further off, as it was.
@@ -998,10 +1147,30 @@ impl LightShadowTracer for TracedLightShadows {
                         }
                     }
                     let at = instance_transform(&Matrix4::identity());
-                    placed.push((shape, at, handle, n, how));
+                    out.placed.push((shape, at, handle, n, how));
                 }
             }
+            out.class = bend_class(&out.reaches, distance);
+            if again {
+                self.revisit.insert(handle);
+            }
+            if wanted.is_empty() {
+                self.bend_wanted.remove(&handle);
+            } else {
+                self.bend_wanted.insert(handle, wanted);
+            }
+            Some(out)
+            };
+            self.contribs[slot] = contrib;
         }
+
+        // Everything kept, in the order of the graph's slots, as when every node was looked at.
+        for contrib in self.contribs.iter().flatten() {
+            placed.extend_from_slice(&contrib.placed);
+            fixed.extend_from_slice(&contrib.fixed);
+        }
+        // The bent geometry wanting bending most, this frame's budget of it below.
+        let mut bend_jobs: Vec<BendJob> = self.bend_wanted.values().flatten().cloned().collect();
 
         // The still meshes put together again where one has come or gone.
         let mut rebuilt = 0;
@@ -1140,6 +1309,15 @@ impl LightShadowTracer for TracedLightShadows {
         poser.pose(server, &bends)?;
         let bent_any = !bends.is_empty();
         for (shape, _, weights, _) in bend_jobs {
+            // Bent: no longer wanted, until its weights change again.
+            if let Shape::Posed(node, _) = shape {
+                if let Some(wanted) = self.bend_wanted.get_mut(&node) {
+                    wanted.retain(|job| job.0 != shape);
+                    if wanted.is_empty() {
+                        self.bend_wanted.remove(&node);
+                    }
+                }
+            }
             self.bent.insert(shape, weights);
         }
         if !same {

@@ -370,7 +370,19 @@ struct SceneMeshes {
     /// How many times the scene has been drawn.
     frame: u64,
     overflow_reported: bool,
+    /// How far into the graph's change journal it has looked (see
+    /// `fyrox::scene::graph::Graph::changes_since`); [`None`] before its first look.
+    journal: Option<u64>,
+    /// Mesh nodes waiting to be placed: their surfaces building, or their materials loading.
+    waiting: FxHashSet<Handle<Node>>,
+    /// Where the look over a slice of every node a frame has got to (see [`SWEEP`]).
+    sweep: u32,
 }
+
+/// How many of the graph's node slots are looked at each frame besides those its change journal
+/// names: changes the journal does not record - made through reflection, say - are caught within
+/// a few seconds.
+const SWEEP: u32 = 256;
 
 /// A scene's Candelite: its surface cache, what it traces against, the captures waiting to be
 /// drawn into the cache, and its view.
@@ -775,6 +787,9 @@ impl SceneMeshes {
             materials,
             candelite,
             frame,
+            journal,
+            waiting,
+            sweep,
             ..
         } = self;
         let pool = pool.get_or_insert_with(|| GeometryPool::new(device, 1 << 16));
@@ -792,12 +807,42 @@ impl SceneMeshes {
         let mut uploaded = 0;
         let mut bending = 0;
         let mut changed = false;
-        for (handle, node) in graph.pair_iter() {
+        // Which nodes to look at: every one, the first time or when the graph's change journal
+        // no longer reaches back to the last look; else those it names, those waiting, and a
+        // slice of every slot in turn.
+        let journaled = journal.and_then(|cursor| graph.changes_since(cursor));
+        let full = journaled.is_none();
+        let candidates: Vec<Handle<Node>> = match journaled {
+            None => graph.pair_iter().map(|(handle, _)| handle).collect(),
+            Some(changes) => {
+                let mut set: FxHashSet<Handle<Node>> = changes.iter().copied().collect();
+                set.extend(waiting.iter().copied());
+                let capacity = graph.capacity();
+                for _ in 0..SWEEP.min(capacity) {
+                    *sweep = (*sweep + 1) % capacity.max(1);
+                    let handle = graph.handle_from_index(*sweep);
+                    if handle.is_some() {
+                        set.insert(handle);
+                    }
+                }
+                set.into_iter().collect()
+            }
+        };
+        *journal = Some(graph.changes_end());
+        // Nodes looked at that are no longer drawn by it: gone, hidden, drawn forward.
+        let mut gone: Vec<Handle<Node>> = Vec::new();
+        for handle in candidates {
+            let Ok(node) = graph.try_get_node(handle) else {
+                gone.push(handle);
+                continue;
+            };
             let Some(mesh) = node.cast::<Mesh>() else {
+                gone.push(handle);
                 continue;
             };
             // Those hidden and those drawn forward stay the renderer's.
             if !node.global_visibility() || mesh.render_path() != RenderPath::Deferred {
+                gone.push(handle);
                 continue;
             }
             let surfaces = mesh.surfaces();
@@ -822,6 +867,10 @@ impl SceneMeshes {
                     Some(vec![Shading::Standard; surfaces.len()])
                 };
                 let Some(shadings) = shadings else {
+                    // Skinned, or its material not drawable; or loading, to be looked into again.
+                    if !surfaces.iter().any(|s| !s.bones().is_empty()) {
+                        waiting.insert(handle);
+                    }
                     continue;
                 };
                 nodes.insert(
@@ -868,8 +917,10 @@ impl SceneMeshes {
                 ready &= built.contains_key(&surface.data().key()) || builder.dag(surface).is_some();
             }
             if !ready {
+                waiting.insert(handle);
                 continue;
             }
+            waiting.remove(&handle);
             for (n, surface) in surfaces.iter().enumerate() {
                 let data = surface.data().key();
                 // A mesh uploaded now, for Candelite: its triangles and full-detail clusters.
@@ -954,17 +1005,30 @@ impl SceneMeshes {
         // The weights set, to the GPU together.
         pool.flush(queue);
 
-        // Nodes gone, hidden or no longer drawable: theirs goes too.
+        // Nodes gone, hidden or no longer drawable: theirs goes too. Looking at every node, any not
+        // seen; else those looked at and found so.
         let mut removed = false;
-        nodes.retain(|handle, drawn| {
-            let keep = drawn.seen == frame;
-            if !keep {
-                release(pool, materials, drawn);
-                changed |= taken_over.remove(handle);
-                removed = true;
+        if full {
+            nodes.retain(|handle, drawn| {
+                let keep = drawn.seen == frame;
+                if !keep {
+                    release(pool, materials, drawn);
+                    changed |= taken_over.remove(handle);
+                    removed = true;
+                }
+                keep
+            });
+            waiting.retain(|handle| nodes.contains_key(handle));
+        } else {
+            for handle in gone {
+                waiting.remove(&handle);
+                if let Some(drawn) = nodes.remove(&handle) {
+                    release(pool, materials, &drawn);
+                    changed |= taken_over.remove(&handle);
+                    removed = true;
+                }
             }
-            keep
-        });
+        }
         if removed {
             // Meshes nothing is placed from any more go, giving back their room in the pool.
             let used: FxHashSet<u64> = nodes.values().flat_map(|d| d.placed.iter().map(|p| p.data)).collect();
