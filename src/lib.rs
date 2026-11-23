@@ -119,6 +119,9 @@ pub struct GraphicsEffects {
     /// [`Self::with_candelite_light_view`].
     #[cfg(feature = "raytracing")]
     candelite_light: bool,
+    /// Whether Candelite lights the frame: see [`Self::with_candelite`].
+    #[cfg(feature = "raytracing")]
+    candelite: bool,
     #[visit(skip)]
     #[reflect(hidden)]
     refraction: Option<Rc<RefCell<RefractionPass>>>,
@@ -203,6 +206,8 @@ impl Default for GraphicsEffects {
             candelite_view: false,
             #[cfg(feature = "raytracing")]
             candelite_light: false,
+            #[cfg(feature = "raytracing")]
+            candelite: false,
             refraction: None,
             soft_shadows: Some(SoftShadows::default()),
             anti_aliasing: Some(AntiAliasing::default()),
@@ -279,6 +284,17 @@ impl GraphicsEffects {
     pub fn with_candelite_view(mut self) -> Self {
         self.yoctite = Some(yoctite::Mode::Render);
         self.candelite_view = true;
+        self
+    }
+
+    /// As [`Self::with_yoctite`], and lit by Candelite's global illumination: the light between
+    /// surfaces - the sky, and sunlight bounced off whatever it falls on, bounce after bounce -
+    /// gathered at every pixel by screen probes, in place of the scene's flat ambient colour
+    /// (see [`yoctite::YoctitePass::light_with_candelite`]).
+    #[cfg(feature = "raytracing")]
+    pub fn with_candelite(mut self) -> Self {
+        self.yoctite = Some(yoctite::Mode::Render);
+        self.candelite = true;
         self
     }
 
@@ -503,6 +519,11 @@ impl Plugin for GraphicsEffects {
                     pass.show_candelite_light();
                 } else if self.candelite_view {
                     pass.show_candelite();
+                }
+                if self.candelite {
+                    let indirect = fyrox::renderer::IndirectDiffuse::default();
+                    graphics_context.renderer.set_indirect_diffuse(Some(indirect.clone()));
+                    pass.light_with_candelite(indirect);
                 }
                 let pass = Rc::new(RefCell::new(pass));
                 graphics_context.renderer.add_render_pass(pass);

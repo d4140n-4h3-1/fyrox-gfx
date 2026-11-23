@@ -71,7 +71,7 @@ use fyrox::{
     },
 };
 use fyrox_graphics_wgpu::{
-    candelite::{self, Bounds, SurfaceCache, SurfaceLight, SurfaceView, Sunlight, TraceScene, ViewShows},
+    candelite::{self, Bounds, ProbeFrame, ScreenProbes, SurfaceCache, SurfaceLight, SurfaceView, Sunlight, TraceScene, ViewShows},
     server::WgpuGraphicsServer,
     texture::WgpuTexture,
     yoctite::{
@@ -372,6 +372,10 @@ struct Candelite {
     view: Option<SurfaceView>,
     /// The light on the cards: see `fyrox_graphics_wgpu::candelite::SurfaceLight`.
     light: Option<SurfaceLight>,
+    /// The screen probes, and the light between surfaces they gather, for the renderer to light
+    /// with: see [`YoctitePass::light_with_candelite`].
+    probes: Option<ScreenProbes>,
+    indirect: Option<GpuTexture>,
     target: Option<GpuTexture>,
     full_reported: bool,
     /// The cutout masks made so far, by texture: foliage is traced as a cutout.
@@ -394,9 +398,13 @@ pub struct YoctitePass {
     builder: Option<Builder>,
     scenes: FxHashMap<Handle<Scene>, SceneMeshes>,
     failed: bool,
-    /// Whether Candelite's surface view is laid over the frame, and what it shows.
+    /// Whether Candelite is kept (its cards captured, its scene traced); whether its surface
+    /// view is laid over the frame, and what it shows; and where the light between surfaces it
+    /// gathers goes, if it lights the frame.
     candelite: bool,
+    candelite_overlay: bool,
     candelite_shows: ViewShows,
+    indirect: Option<fyrox::renderer::IndirectDiffuse>,
 }
 
 impl YoctitePass {
@@ -413,7 +421,9 @@ impl YoctitePass {
             scenes: Default::default(),
             failed: false,
             candelite: false,
+            candelite_overlay: false,
             candelite_shows: ViewShows::Shaded,
+            indirect: None,
         }
     }
 
@@ -422,6 +432,18 @@ impl YoctitePass {
     /// place of the renderer, and where rays can be traced.
     pub fn show_candelite(&mut self) {
         self.candelite = true;
+        self.candelite_overlay = true;
+    }
+
+    /// Lights the frame with Candelite's global illumination: each frame its cards are lit (the
+    /// sun with traced shadows, and the light between surfaces), and screen probes gather from
+    /// them the light reaching every pixel, put in `indirect` under the scene's handle for the
+    /// renderer to light with in place of the ambient colour (see
+    /// `fyrox::renderer::Renderer::set_indirect_diffuse`). Only drawing in place of the renderer,
+    /// and where rays can be traced.
+    pub fn light_with_candelite(&mut self, indirect: fyrox::renderer::IndirectDiffuse) {
+        self.candelite = true;
+        self.indirect = Some(indirect);
     }
 
     /// As [`Self::show_candelite`], and lights the cards - the sun with traced shadows, and the
@@ -429,6 +451,7 @@ impl YoctitePass {
     /// hit: Candelite's global illumination as its rays see it.
     pub fn show_candelite_light(&mut self) {
         self.candelite = true;
+        self.candelite_overlay = true;
         self.candelite_shows = ViewShows::Lit;
     }
 }
@@ -705,6 +728,8 @@ impl SceneMeshes {
                 pending: Vec::new(),
                 view: SurfaceView::new(device),
                 light: SurfaceLight::new(device),
+                probes: None,
+                indirect: None,
                 target: None,
                 full_reported: false,
                 masks: Default::default(),
@@ -1001,7 +1026,7 @@ impl YoctitePass {
     /// Lays Candelite's surface view over the frame, if it is shown (see
     /// [`Self::show_candelite`]).
     fn candelite_view(&mut self, ctx: SceneRenderPassContext) -> Result<RenderPassStatistics, FrameworkError> {
-        if !self.candelite || self.failed {
+        if !self.candelite_overlay || self.failed {
             return Ok(Default::default());
         }
         let Some(server) = ctx.server.as_any().downcast_ref::<WgpuGraphicsServer>() else {
@@ -1042,27 +1067,7 @@ impl YoctitePass {
         for (column, values) in inverse.column_iter().zip(inverse_columns.iter_mut()) {
             values.copy_from_slice(column.as_slice());
         }
-        // The sun: the scene's first directional light, its up vector towards the sun as the
-        // renderer lights with it; and the sky, its ambient light.
-        let sun = ctx.scene.graph.linear_iter().find_map(|node| node.cast::<DirectionalLight>());
-        let colour = |c: fyrox::core::color::Color| [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0];
-        let sky = colour(ctx.scene.rendering_options.ambient_lighting_color);
-        let sunlight = match sun {
-            Some(sun) => {
-                let base: &BaseLight = sun.base_light_ref();
-                let toward = sun.up_vector().try_normalize(f32::EPSILON).unwrap_or_else(Vector3::y);
-                Sunlight {
-                    toward_sun: toward.into(),
-                    sun: colour(base.color()).map(|c| c * base.intensity()),
-                    sky,
-                }
-            }
-            None => Sunlight {
-                toward_sun: [0.0, 1.0, 0.0],
-                sun: [0.0; 3],
-                sky,
-            },
-        };
+        let sunlight = sunlight_of(ctx.scene);
         let eye: [f32; 3] = position.translation.into();
         server.flush_active_pass();
         let mut encoder = server.frame_encoder.borrow_mut().take().unwrap_or_else(|| {
@@ -1072,7 +1077,8 @@ impl YoctitePass {
             *server.frame_encoder.borrow_mut() = Some(encoder);
             return Ok(Default::default());
         };
-        if self.candelite_shows == ViewShows::Lit {
+        // Lit already, in the G-Buffer pass, when it lights the frame.
+        if self.candelite_shows == ViewShows::Lit && self.indirect.is_none() {
             light.update(device, &mut encoder, &mut candelite.scene, pool, &mut candelite.cache, eye, &sunlight);
             if light.is_full() && !candelite.full_reported {
                 Log::warn("Candelite: its radiance atlas is full; instances past it are lit where rays hit them");
@@ -1199,6 +1205,12 @@ impl SceneRenderPass for YoctitePass {
             }
             candelite.scene.update(device, &mut encoder, pool);
             *server.frame_encoder.borrow_mut() = Some(encoder);
+            // The light between surfaces, for the renderer to light the frame with.
+            if let Some(indirect) = &self.indirect {
+                if let Err(err) = gather(server, candelite, pool, &ctx, indirect) {
+                    Log::err(format!("Candelite could not light the frame: {err:?}"));
+                }
+            }
         }
         let drew = started.elapsed().as_secs_f64();
         let (clusters, triangles) = scene.chosen("").unwrap_or_default();
@@ -1366,4 +1378,118 @@ mod tests {
         assert_eq!(materials.take(&c, Shading::Standard), 0, "its slot used again");
         assert_eq!(materials.slots(), 2);
     }
+}
+
+/// The light Candelite lights with: the scene's first directional light - its up vector towards
+/// the sun, as the renderer lights with it, its colour linear times its intensity over pi, as the
+/// renderer's diffuse lighting gives off - and the sky, its ambient lighting colour, linear.
+fn sunlight_of(scene: &Scene) -> Sunlight {
+    let linear = |c: fyrox::core::color::Color| {
+        [c.r, c.g, c.b].map(|c| {
+            let c = c as f32 / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        })
+    };
+    let sky = linear(scene.rendering_options.ambient_lighting_color);
+    match scene.graph.linear_iter().find_map(|node| node.cast::<DirectionalLight>()) {
+        Some(sun) => {
+            let base: &BaseLight = sun.base_light_ref();
+            let toward = sun.up_vector().try_normalize(f32::EPSILON).unwrap_or_else(Vector3::y);
+            Sunlight {
+                toward_sun: toward.into(),
+                sun: linear(base.color()).map(|c| c * base.intensity() / std::f32::consts::PI),
+                sky,
+            }
+        }
+        None => Sunlight {
+            toward_sun: [0.0, 1.0, 0.0],
+            sun: [0.0; 3],
+            sky,
+        },
+    }
+}
+
+/// Lights Candelite's cards and gathers with its screen probes the light between surfaces at
+/// each pixel of the G-Buffer just drawn, into a texture of its own, put in `indirect` for the
+/// renderer to light the frame with.
+fn gather(
+    server: &WgpuGraphicsServer,
+    candelite: &mut Candelite,
+    pool: &GeometryPool,
+    ctx: &GBufferPassContext,
+    indirect: &fyrox::renderer::IndirectDiffuse,
+) -> Result<(), FrameworkError> {
+    let device = &server.state.device;
+    let (Some(light), Some(depth_attachment)) = (candelite.light.as_mut(), ctx.framebuffer.depth_attachment()) else {
+        return Ok(());
+    };
+    let Some(normal_attachment) = ctx.framebuffer.color_attachments().get(1) else {
+        return Ok(());
+    };
+    let (Some(depth), Some(normal)) = (
+        depth_attachment.texture.as_any().downcast_ref::<WgpuTexture>(),
+        normal_attachment.texture.as_any().downcast_ref::<WgpuTexture>(),
+    ) else {
+        return Ok(());
+    };
+    let (width, height) = (depth.wgpu_texture().width() as usize, depth.wgpu_texture().height() as usize);
+    let fits = candelite.indirect.as_ref().is_some_and(|t| {
+        matches!(t.kind(), GpuTextureKind::Rectangle { width: w, height: h } if w == width && h == height)
+    });
+    if !fits {
+        candelite.indirect = Some(server.create_texture(GpuTextureDescriptor {
+            name: "CandeliteIndirect",
+            kind: GpuTextureKind::Rectangle { width, height },
+            pixel_kind: PixelKind::RGBA16F,
+            ..Default::default()
+        })?);
+    }
+    let target = candelite.indirect.clone().expect("made above");
+    let Some(wgpu_target) = target.as_any().downcast_ref::<WgpuTexture>() else {
+        return Ok(());
+    };
+    let probes = match candelite.probes.as_mut() {
+        Some(probes) => probes,
+        None => match ScreenProbes::new(device) {
+            Some(probes) => candelite.probes.insert(probes),
+            None => return Ok(()),
+        },
+    };
+    let sunlight = sunlight_of(ctx.scene);
+    let position = &ctx.observer.position;
+    let Some(inverse) = position.view_projection_matrix.try_inverse() else {
+        return Ok(());
+    };
+    let mut encoder = server.frame_encoder.borrow_mut().take().unwrap_or_else(|| device.create_command_encoder(&Default::default()));
+    light.update(device, &mut encoder, &mut candelite.scene, pool, &mut candelite.cache, position.translation.into(), &sunlight);
+    let columns = |m: &Matrix4<f32>| {
+        let mut out = [[0.0f32; 4]; 4];
+        for (column, values) in m.column_iter().zip(out.iter_mut()) {
+            values.copy_from_slice(column.as_slice());
+        }
+        out
+    };
+    probes.record(
+        device,
+        &mut encoder,
+        &mut candelite.scene,
+        pool,
+        &mut candelite.cache,
+        light,
+        &sunlight,
+        &ProbeFrame {
+            depth: depth.wgpu_texture(),
+            normal: normal.wgpu_texture(),
+            view_projection: columns(&position.view_projection_matrix),
+            inverse_view_projection: columns(&inverse),
+            target: wgpu_target.wgpu_texture(),
+        },
+    );
+    *server.frame_encoder.borrow_mut() = Some(encoder);
+    indirect.borrow_mut().insert(ctx.scene_handle, target);
+    Ok(())
 }
