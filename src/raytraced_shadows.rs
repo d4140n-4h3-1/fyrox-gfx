@@ -377,6 +377,15 @@ pub const SKIN_REACH: f32 = 30.0;
 /// How far from the camera a mesh bent by blend shapes is bent in its shadow too, in meters.
 pub const BEND_REACH: f32 = 40.0;
 
+/// How far a mesh's shapes have to be able to move it - each at full strength, added up - for
+/// its shadow to be bent too, for each meter it is from the camera. Wind seldom drives a shape
+/// past a fifth of its strength, so this is about a pixel of a half-resolution shadow: a tree,
+/// its limbs reaching half a meter or more, is bent all through [`BEND_REACH`]; a foxglove out to
+/// about 40 m, a bilberry to about 12. Each mesh bent needs geometry of its own, which the scene
+/// traced costs to put together every frame, so a meadow bent where its sway cannot be seen would
+/// cost much for nothing.
+pub const BEND_SHOWS: f32 = 0.02;
+
 /// How far, in meters, a bent mesh's vertices may have moved since its shadow's geometry was
 /// last bent before it is bent again: less than a soft shadow shows.
 pub const BEND_LEAST: f32 = 0.01;
@@ -396,6 +405,8 @@ struct Bend {
     offsets: Vec<Vec<Vector3<f32>>>,
     /// How far each shape moves the vertex it moves furthest, at full strength.
     reach: Vec<f32>,
+    /// Those added up: about the furthest its shapes together move it.
+    sway: f32,
 }
 
 impl Bend {
@@ -416,7 +427,9 @@ impl Bend {
             .map(|t| morphs.iter().map(|m| Vector3::new(m[t][0], m[t][1], m[t][2])).collect())
             .collect();
         let reach = offsets.iter().map(|o: &Vec<Vector3<f32>>| o.iter().map(|o| o.norm()).fold(0.0, f32::max)).collect();
-        Some(Self { positions, offsets, reach })
+        let reach: Vec<f32> = reach;
+        let sway = reach.iter().sum();
+        Some(Self { positions, offsets, reach, sway })
     }
 
     /// At most how far its vertices have moved, in its own space, going from `from` weights to
@@ -894,8 +907,8 @@ impl LightShadowTracer for TracedLightShadows {
             // so that its weights coming and going put no cube together again.
             let weights: Vec<f32> = mesh.blend_shapes().iter().map(|s| s.weight / 100.0).collect();
             let bending = !weights.is_empty();
-            let bend_near = bending
-                && camera.is_none_or(|camera| (node.global_position() - camera).norm() < BEND_REACH);
+            let distance = camera.map_or(0.0, |camera| (node.global_position() - camera).norm());
+            let bend_near = bending && distance < BEND_REACH;
             // How much the mesh is scaled up, at most: its drift is in its own space.
             let scale = (0..3).map(|c| transform.fixed_view::<3, 1>(0, c).norm()).fold(0.0, f32::max);
             for (n, surface) in mesh.surfaces().iter().enumerate() {
@@ -908,7 +921,14 @@ impl LightShadowTracer for TracedLightShadows {
                     continue;
                 };
                 let key = surface.data().key();
-                let has_morph = bend_near && {
+                let shows = bend_near
+                    && self
+                        .bends
+                        .entry(key)
+                        .or_insert_with(|| Bend::read(surface))
+                        .as_ref()
+                        .is_some_and(|bend| bend.sway * scale >= distance * BEND_SHOWS);
+                let has_morph = shows && {
                     let device = &server.state.device;
                     let bends = &mut self.bends;
                     self.morphs
