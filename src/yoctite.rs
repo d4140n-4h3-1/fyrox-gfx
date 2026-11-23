@@ -169,12 +169,21 @@ struct Materials {
     by_key: FxHashMap<u64, Slot>,
     free: Vec<u32>,
     next: u32,
+    /// Which diffuse textures have see-through texels: their materials are thin, and let light
+    /// through (see [`LEAF_TRANSMISSION`]).
+    masks: crate::raytraced_shadows::Masks,
 }
+
+/// How much of the light falling on the back of a cutout material (leaves, needles, grass) comes
+/// through it: written into the G-Buffer for the sun's light pass and Candelite. A real leaf lets
+/// through about as much as it reflects; this is a little under that, since a cutout card often
+/// stands for several leaves.
+pub const LEAF_TRANSMISSION: f32 = 0.5;
 
 impl Materials {
     /// The slot of `material`, given one if it has none, counted as used once more.
     fn take(&mut self, material: &MaterialResource, shading: Shading) -> u32 {
-        let Self { by_key, free, next } = self;
+        let Self { by_key, free, next, .. } = self;
         let slot = by_key.entry(material.key()).or_insert_with(|| Slot {
             slot: free.pop().unwrap_or_else(|| {
                 *next += 1;
@@ -636,9 +645,10 @@ fn texture_of(
 }
 
 /// A material in a slot, as Yoctite's G-Buffer draw reads it.
-fn resolve(slot: &Slot, ctx: &mut GBufferPassContext) -> Option<YoctiteMaterial> {
+fn resolve(slot: &Slot, masks: &mut crate::raytraced_shadows::Masks, ctx: &mut GBufferPassContext) -> Option<YoctiteMaterial> {
     let state = slot.material.state();
     let material = state.data_ref()?;
+    let transmission = if crate::raytraced_shadows::cutout(material, masks).is_some() { LEAF_TRANSMISSION } else { 0.0 };
     let float = |name, default: f32| match value_of(material, name) {
         Some(MaterialProperty::Float(v)) => v,
         _ => default,
@@ -694,6 +704,7 @@ fn resolve(slot: &Slot, ctx: &mut GBufferPassContext) -> Option<YoctiteMaterial>
             layer_index,
             metallic_channel,
             roughness_channel,
+            transmission,
             ..Default::default()
         },
         textures,
@@ -1166,12 +1177,8 @@ impl SceneRenderPass for YoctitePass {
             builder.forget_unused(self.scenes.values());
         }
         let scene = self.scenes.get_mut(&ctx.scene_handle).expect("synced above");
-        let materials: Vec<YoctiteMaterial> = scene
-            .materials
-            .by_key
-            .values()
-            .filter_map(|slot| resolve(slot, &mut ctx))
-            .collect();
+        let Materials { by_key, masks, .. } = &mut scene.materials;
+        let materials: Vec<YoctiteMaterial> = by_key.values().filter_map(|slot| resolve(slot, masks, &mut ctx)).collect();
         let synced = started.elapsed().as_secs_f64();
 
         let eye = ctx.observer.position.translation;
@@ -1509,6 +1516,7 @@ fn gather(
     let frame = ProbeFrame {
         depth: depth.wgpu_texture(),
         normal: normal.wgpu_texture(),
+        material: material.wgpu_texture(),
         view_projection: columns(&position.view_projection_matrix),
         inverse_view_projection: columns(&inverse),
         target: wgpu_target.wgpu_texture(),
@@ -1525,7 +1533,6 @@ fn gather(
         radiance,
         &sunlight,
         &frame,
-        material.wgpu_texture(),
         wgpu_reflected.wgpu_texture(),
     );
     server.gpu_mark_in(&mut encoder, "Candelite: reflections");

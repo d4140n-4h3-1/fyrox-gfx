@@ -250,7 +250,9 @@ pub(crate) fn material_mask(material: &MaterialResource, masks: &mut Masks) -> O
     masks.get(&key).cloned().flatten()
 }
 
-fn cutout(material: &fyrox::material::Material, masks: &mut Masks) -> Option<u64> {
+/// The key of `material`'s cutout mask in `masks` (made and kept there the first time), if its
+/// diffuse texture has see-through texels: leaves, needles, grass.
+pub(crate) fn cutout(material: &fyrox::material::Material, masks: &mut Masks) -> Option<u64> {
     let texture = material.texture_ref("diffuseTexture")?.value.clone()?;
     let alpha = match property(material, "diffuseColor") {
         Some(MaterialProperty::Color(color)) => color.a,
@@ -1279,6 +1281,7 @@ impl LightShadowTracer for TracedLightShadows {
             scene,
             ctx.depth,
             ctx.normals,
+            ctx.materials,
             ShadowRayParameters {
                 inverse_view_projection: matrix_to_array(&ctx.inv_view_projection),
                 light,
