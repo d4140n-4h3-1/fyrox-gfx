@@ -522,8 +522,10 @@ impl Plugin for GraphicsEffects {
                 }
                 if self.candelite {
                     let indirect = fyrox::renderer::IndirectDiffuse::default();
+                    let specular = fyrox::renderer::IndirectSpecular::default();
                     graphics_context.renderer.set_indirect_diffuse(Some(indirect.clone()));
-                    pass.light_with_candelite(indirect);
+                    graphics_context.renderer.set_indirect_specular(Some(specular.clone()));
+                    pass.light_with_candelite(indirect, specular);
                 }
                 let pass = Rc::new(RefCell::new(pass));
                 graphics_context.renderer.add_render_pass(pass);

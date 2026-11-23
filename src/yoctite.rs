@@ -71,7 +71,7 @@ use fyrox::{
     },
 };
 use fyrox_graphics_wgpu::{
-    candelite::{self, Bounds, ProbeFrame, RadianceCache, ScreenProbes, SurfaceCache, SurfaceLight, SurfaceView, Sunlight, TraceScene, ViewShows},
+    candelite::{self, Bounds, ProbeFrame, RadianceCache, Reflections, ScreenProbes, SurfaceCache, SurfaceLight, SurfaceView, Sunlight, TraceScene, ViewShows},
     server::WgpuGraphicsServer,
     texture::WgpuTexture,
     yoctite::{
@@ -377,6 +377,10 @@ struct Candelite {
     probes: Option<ScreenProbes>,
     radiance: Option<RadianceCache>,
     indirect: Option<GpuTexture>,
+    /// The reflections, and the light they bring each pixel, for the renderer to light its
+    /// specular term with.
+    reflections: Option<Reflections>,
+    specular: Option<GpuTexture>,
     target: Option<GpuTexture>,
     full_reported: bool,
     /// The cutout masks made so far, by texture: foliage is traced as a cutout.
@@ -401,11 +405,11 @@ pub struct YoctitePass {
     failed: bool,
     /// Whether Candelite is kept (its cards captured, its scene traced); whether its surface
     /// view is laid over the frame, and what it shows; and where the light between surfaces it
-    /// gathers goes, if it lights the frame.
+    /// gathers and the reflections it traces go, if it lights the frame.
     candelite: bool,
     candelite_overlay: bool,
     candelite_shows: ViewShows,
-    indirect: Option<fyrox::renderer::IndirectDiffuse>,
+    indirect: Option<(fyrox::renderer::IndirectDiffuse, fyrox::renderer::IndirectSpecular)>,
 }
 
 impl YoctitePass {
@@ -440,11 +444,12 @@ impl YoctitePass {
     /// sun with traced shadows, and the light between surfaces), and screen probes gather from
     /// them the light reaching every pixel, put in `indirect` under the scene's handle for the
     /// renderer to light with in place of the ambient colour (see
-    /// `fyrox::renderer::Renderer::set_indirect_diffuse`). Only drawing in place of the renderer,
-    /// and where rays can be traced.
-    pub fn light_with_candelite(&mut self, indirect: fyrox::renderer::IndirectDiffuse) {
+    /// `fyrox::renderer::Renderer::set_indirect_diffuse`); and reflections are traced, put in
+    /// `specular` likewise (see `fyrox::renderer::Renderer::set_indirect_specular`). Only drawing
+    /// in place of the renderer, and where rays can be traced.
+    pub fn light_with_candelite(&mut self, indirect: fyrox::renderer::IndirectDiffuse, specular: fyrox::renderer::IndirectSpecular) {
         self.candelite = true;
-        self.indirect = Some(indirect);
+        self.indirect = Some((indirect, specular));
     }
 
     /// As [`Self::show_candelite`], and lights the cards - the sun with traced shadows, and the
@@ -732,6 +737,8 @@ impl SceneMeshes {
                 probes: None,
                 radiance: None,
                 indirect: None,
+                reflections: None,
+                specular: None,
                 target: None,
                 full_reported: false,
                 masks: Default::default(),
@@ -1208,8 +1215,8 @@ impl SceneRenderPass for YoctitePass {
             candelite.scene.update(device, &mut encoder, pool);
             *server.frame_encoder.borrow_mut() = Some(encoder);
             // The light between surfaces, for the renderer to light the frame with.
-            if let Some(indirect) = &self.indirect {
-                if let Err(err) = gather(server, candelite, pool, &ctx, indirect) {
+            if let Some((indirect, specular)) = &self.indirect {
+                if let Err(err) = gather(server, candelite, pool, &ctx, indirect, specular) {
                     Log::err(format!("Candelite could not light the frame: {err:?}"));
                 }
             }
@@ -1424,12 +1431,18 @@ fn gather(
     pool: &GeometryPool,
     ctx: &GBufferPassContext,
     indirect: &fyrox::renderer::IndirectDiffuse,
+    specular: &fyrox::renderer::IndirectSpecular,
 ) -> Result<(), FrameworkError> {
     let device = &server.state.device;
     let (Some(light), Some(depth_attachment)) = (candelite.light.as_mut(), ctx.framebuffer.depth_attachment()) else {
         return Ok(());
     };
-    let Some(normal_attachment) = ctx.framebuffer.color_attachments().get(1) else {
+    let (Some(normal_attachment), Some(material_attachment)) =
+        (ctx.framebuffer.color_attachments().get(1), ctx.framebuffer.color_attachments().get(3))
+    else {
+        return Ok(());
+    };
+    let Some(material) = material_attachment.texture.as_any().downcast_ref::<WgpuTexture>() else {
         return Ok(());
     };
     let (Some(depth), Some(normal)) = (
@@ -1439,19 +1452,24 @@ fn gather(
         return Ok(());
     };
     let (width, height) = (depth.wgpu_texture().width() as usize, depth.wgpu_texture().height() as usize);
-    let fits = candelite.indirect.as_ref().is_some_and(|t| {
-        matches!(t.kind(), GpuTextureKind::Rectangle { width: w, height: h } if w == width && h == height)
-    });
-    if !fits {
-        candelite.indirect = Some(server.create_texture(GpuTextureDescriptor {
-            name: "CandeliteIndirect",
-            kind: GpuTextureKind::Rectangle { width, height },
-            pixel_kind: PixelKind::RGBA16F,
-            ..Default::default()
-        })?);
+    let fits = |t: &Option<GpuTexture>| {
+        t.as_ref().is_some_and(|t| matches!(t.kind(), GpuTextureKind::Rectangle { width: w, height: h } if w == width && h == height))
+    };
+    for (texture, name) in [(&mut candelite.indirect, "CandeliteIndirect"), (&mut candelite.specular, "CandeliteSpecular")] {
+        if !fits(texture) {
+            *texture = Some(server.create_texture(GpuTextureDescriptor {
+                name,
+                kind: GpuTextureKind::Rectangle { width, height },
+                pixel_kind: PixelKind::RGBA16F,
+                ..Default::default()
+            })?);
+        }
     }
     let target = candelite.indirect.clone().expect("made above");
-    let Some(wgpu_target) = target.as_any().downcast_ref::<WgpuTexture>() else {
+    let reflected = candelite.specular.clone().expect("made above");
+    let (Some(wgpu_target), Some(wgpu_reflected)) =
+        (target.as_any().downcast_ref::<WgpuTexture>(), reflected.as_any().downcast_ref::<WgpuTexture>())
+    else {
         return Ok(());
     };
     if candelite.probes.is_none() {
@@ -1460,7 +1478,12 @@ fn gather(
     if candelite.radiance.is_none() {
         candelite.radiance = RadianceCache::new(device);
     }
-    let (Some(probes), Some(radiance)) = (candelite.probes.as_mut(), candelite.radiance.as_mut()) else {
+    if candelite.reflections.is_none() {
+        candelite.reflections = Reflections::new(device);
+    }
+    let (Some(probes), Some(radiance), Some(reflections)) =
+        (candelite.probes.as_mut(), candelite.radiance.as_mut(), candelite.reflections.as_mut())
+    else {
         return Ok(());
     };
     let sunlight = sunlight_of(ctx.scene);
@@ -1483,7 +1506,16 @@ fn gather(
         }
         out
     };
-    probes.record(
+    let frame = ProbeFrame {
+        depth: depth.wgpu_texture(),
+        normal: normal.wgpu_texture(),
+        view_projection: columns(&position.view_projection_matrix),
+        inverse_view_projection: columns(&inverse),
+        target: wgpu_target.wgpu_texture(),
+    };
+    probes.record(device, &mut encoder, &mut candelite.scene, pool, &mut candelite.cache, light, radiance, &sunlight, &frame);
+    server.gpu_mark_in(&mut encoder, "Candelite: screen probes");
+    reflections.record(
         device,
         &mut encoder,
         &mut candelite.scene,
@@ -1492,16 +1524,13 @@ fn gather(
         light,
         radiance,
         &sunlight,
-        &ProbeFrame {
-            depth: depth.wgpu_texture(),
-            normal: normal.wgpu_texture(),
-            view_projection: columns(&position.view_projection_matrix),
-            inverse_view_projection: columns(&inverse),
-            target: wgpu_target.wgpu_texture(),
-        },
+        &frame,
+        material.wgpu_texture(),
+        wgpu_reflected.wgpu_texture(),
     );
-    server.gpu_mark_in(&mut encoder, "Candelite: screen probes");
+    server.gpu_mark_in(&mut encoder, "Candelite: reflections");
     *server.frame_encoder.borrow_mut() = Some(encoder);
     indirect.borrow_mut().insert(ctx.scene_handle, target);
+    specular.borrow_mut().insert(ctx.scene_handle, reflected);
     Ok(())
 }
