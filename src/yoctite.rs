@@ -71,7 +71,7 @@ use fyrox::{
     },
 };
 use fyrox_graphics_wgpu::{
-    candelite::{self, Bounds, ProbeFrame, ScreenProbes, SurfaceCache, SurfaceLight, SurfaceView, Sunlight, TraceScene, ViewShows},
+    candelite::{self, Bounds, ProbeFrame, RadianceCache, ScreenProbes, SurfaceCache, SurfaceLight, SurfaceView, Sunlight, TraceScene, ViewShows},
     server::WgpuGraphicsServer,
     texture::WgpuTexture,
     yoctite::{
@@ -375,6 +375,7 @@ struct Candelite {
     /// The screen probes, and the light between surfaces they gather, for the renderer to light
     /// with: see [`YoctitePass::light_with_candelite`].
     probes: Option<ScreenProbes>,
+    radiance: Option<RadianceCache>,
     indirect: Option<GpuTexture>,
     target: Option<GpuTexture>,
     full_reported: bool,
@@ -729,6 +730,7 @@ impl SceneMeshes {
                 view: SurfaceView::new(device),
                 light: SurfaceLight::new(device),
                 probes: None,
+                radiance: None,
                 indirect: None,
                 target: None,
                 full_reported: false,
@@ -1452,12 +1454,14 @@ fn gather(
     let Some(wgpu_target) = target.as_any().downcast_ref::<WgpuTexture>() else {
         return Ok(());
     };
-    let probes = match candelite.probes.as_mut() {
-        Some(probes) => probes,
-        None => match ScreenProbes::new(device) {
-            Some(probes) => candelite.probes.insert(probes),
-            None => return Ok(()),
-        },
+    if candelite.probes.is_none() {
+        candelite.probes = ScreenProbes::new(device);
+    }
+    if candelite.radiance.is_none() {
+        candelite.radiance = RadianceCache::new(device);
+    }
+    let (Some(probes), Some(radiance)) = (candelite.probes.as_mut(), candelite.radiance.as_mut()) else {
+        return Ok(());
     };
     let sunlight = sunlight_of(ctx.scene);
     let position = &ctx.observer.position;
@@ -1465,7 +1469,13 @@ fn gather(
         return Ok(());
     };
     let mut encoder = server.frame_encoder.borrow_mut().take().unwrap_or_else(|| device.create_command_encoder(&Default::default()));
-    light.update(device, &mut encoder, &mut candelite.scene, pool, &mut candelite.cache, position.translation.into(), &sunlight);
+    let eye: [f32; 3] = position.translation.into();
+    // Timed apart, as GPU marks: the cards lit, the radiance cache, the screen probes.
+    server.gpu_mark_in(&mut encoder, "G-buffer: custom passes (Yoctite)");
+    light.update(device, &mut encoder, &mut candelite.scene, pool, &mut candelite.cache, eye, &sunlight);
+    server.gpu_mark_in(&mut encoder, "Candelite: cards lit");
+    radiance.update(device, &mut encoder, &mut candelite.scene, pool, &mut candelite.cache, light, eye, &sunlight);
+    server.gpu_mark_in(&mut encoder, "Candelite: radiance cache");
     let columns = |m: &Matrix4<f32>| {
         let mut out = [[0.0f32; 4]; 4];
         for (column, values) in m.column_iter().zip(out.iter_mut()) {
@@ -1480,6 +1490,7 @@ fn gather(
         pool,
         &mut candelite.cache,
         light,
+        radiance,
         &sunlight,
         &ProbeFrame {
             depth: depth.wgpu_texture(),
@@ -1489,6 +1500,7 @@ fn gather(
             target: wgpu_target.wgpu_texture(),
         },
     );
+    server.gpu_mark_in(&mut encoder, "Candelite: screen probes");
     *server.frame_encoder.borrow_mut() = Some(encoder);
     indirect.borrow_mut().insert(ctx.scene_handle, target);
     Ok(())

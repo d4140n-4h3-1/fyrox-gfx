@@ -97,7 +97,7 @@ use fyrox::{
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 use fyrox_graphics_wgpu::{
     raytracing::{
-        CutoutMask, RayTracedGeometry, RayTracedInstance, RayTracedMorph, RayTracedPoser, RayTracedScene, ShadowRayLight,
+        CutoutCorners, CutoutMask, RayTracedGeometry, RayTracedInstance, RayTracedMorph, RayTracedPoser, RayTracedScene, ShadowRayLight,
         ShadowRayParameters, ShadowTracer,
     },
     server::WgpuGraphicsServer,
@@ -385,6 +385,11 @@ pub const BEND_REACH: f32 = 40.0;
 /// traced costs to put together every frame, so a meadow bent where its sway cannot be seen would
 /// cost much for nothing.
 pub const BEND_SHOWS: f32 = 0.02;
+
+/// How many bent meshes are given geometry of their own a frame, at most: the floor streams in
+/// plants a patch at a time, and building them all at once stalled a frame for tens of
+/// milliseconds. One waiting its turn casts the shadow of its mesh unbent meanwhile.
+pub const BEND_NEW_PER_FRAME: usize = 16;
 
 /// How far, in meters, a bent mesh's vertices may have moved since its shadow's geometry was
 /// last bent before it is bent again: less than a soft shadow shows.
@@ -751,6 +756,9 @@ pub struct TracedLightShadows {
     /// Each surface with blend shapes on the GPU, by its data, and what bends copies of it.
     morphs: FxHashMap<u64, Option<RayTracedMorph>>,
     poser: Option<RayTracedPoser>,
+    /// Each cutout surface's corners' texture coordinates, by its data, shared by every copy of
+    /// it built: so the scene keeps one record of its cutout for them all.
+    corners: FxHashMap<u64, CutoutCorners>,
     /// The cutout masks made so far, kept for as long as the scene is traced.
     masks: Masks,
     unsupported_reported: bool,
@@ -794,6 +802,7 @@ impl TracedLightShadows {
             bent: Default::default(),
             morphs: Default::default(),
             poser: None,
+            corners: Default::default(),
             masks: Default::default(),
             unsupported_reported: false,
         }
@@ -841,6 +850,7 @@ impl LightShadowTracer for TracedLightShadows {
             self.bends.clear();
             self.bent.clear();
             self.morphs.clear();
+            self.corners.clear();
             self.masks.clear();
             self.scene_handle = Some(scene_handle);
         }
@@ -863,6 +873,7 @@ impl LightShadowTracer for TracedLightShadows {
         // Bent geometry to bend this frame: which, whose blend shapes (by surface data), by what,
         // and how far it has moved, in meters, since it was last bent.
         let mut bend_jobs: Vec<(Shape, u64, Vec<f32>, f32)> = Vec::new();
+        let mut new_bent = 0;
         let mut what_blocks: FxHashMap<u64, Option<Blocks>> = FxHashMap::default();
         self.frame += 1;
         let frame = self.frame;
@@ -939,6 +950,13 @@ impl LightShadowTracer for TracedLightShadows {
                         })
                         .is_some()
                 };
+                // Geometry of its own only within this frame's share of new ones (see
+                // BEND_NEW_PER_FRAME); else, for now, the shadow of its mesh unbent.
+                let has_morph = has_morph
+                    && (self.geometry.contains_key(&Shape::Posed(handle, n)) || {
+                        new_bent += 1;
+                        new_bent <= BEND_NEW_PER_FRAME
+                    });
                 if surface.bones().is_empty() && has_morph {
                     // Built unbent the first time, then bent on the GPU once it has moved enough to show.
                     let shape = Shape::Posed(handle, n);
@@ -1056,9 +1074,16 @@ impl LightShadowTracer for TracedLightShadows {
             else {
                 continue;
             };
-            let vertices = match posed_vertices(&shape) {
-                Some(vertices) => vertices.clone(),
-                None => positions(graph, surface),
+            // A bent mesh's copy starts unbent, as its blend shapes were read: no need to read
+            // its vertices again for every copy.
+            let unbent = match (shape, surface.bones().is_empty()) {
+                (Shape::Posed(..), true) => self.bends.get(&surface.data().key()).and_then(|b| b.as_ref()).map(Bend::flat_positions),
+                _ => None,
+            };
+            let vertices = match (posed_vertices(&shape), unbent) {
+                (Some(vertices), _) => vertices.clone(),
+                (None, Some(unbent)) => unbent,
+                (None, None) => positions(graph, surface),
             };
             let indices = triangles(surface, vertices.len() / 3);
             let updatable = matches!(shape, Shape::Posed(..));
@@ -1068,8 +1093,15 @@ impl LightShadowTracer for TracedLightShadows {
             };
             let geometry = match (how, mask) {
                 (Blocks::Cutout(_), Some(mask)) => {
-                    let uvs = texture_coordinates(surface, vertices.len() / 3);
-                    server.build_ray_traced_cutout(&vertices, &indices, &uvs, mask, updatable)?
+                    let corners = self
+                        .corners
+                        .entry(surface.data().key())
+                        .or_insert_with(|| {
+                            let uvs = texture_coordinates(surface, vertices.len() / 3);
+                            WgpuGraphicsServer::cutout_corners(&indices, &uvs)
+                        })
+                        .clone();
+                    server.build_ray_traced_cutout_sharing(&vertices, &indices, corners, mask, updatable)?
                 }
                 (Blocks::Glass(_), _) => server.build_ray_traced_glass(&vertices, &indices, updatable)?,
                 _ => server.build_ray_traced_geometry(&vertices, &indices, updatable)?,
