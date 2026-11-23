@@ -43,13 +43,12 @@
 //! still cast shadows while they stand still, since a game hides what the camera cannot see; once a mesh has moved, or if it is skinned, it casts none while
 //! hidden, as with shadow maps.
 //!
-//! A mesh bent by its blend shapes - a tree swaying in the wind - is bent the same way, within
-//! [`BEND_REACH`]: its vertices moved by its weights as the renderer moves them, on the CPU, and
-//! its geometry refitted - if it is big enough for that to show ([`BEND_SMALLEST`]). A forest has
-//! many of them, so each is bent again only every
-//! [`BEND_EVERY`] frames, in turn - its shadow following a sway a moment late, which the frames'
-//! averaging hides - and only the vertices its triangles use. Further off, it casts the shadow of
-//! the mesh unbent. A mesh that bends is never put in with the still meshes, so coming within
+//! A mesh bent by its blend shapes - a tree swaying in the wind, a fern - is bent the same way
+//! within [`BEND_REACH`], every frame its weights change, so its shadow moves with it: its
+//! geometry, a copy of its own, is bent by its weights on the GPU, as the renderer bends the mesh,
+//! and refitted (`fyrox_graphics_wgpu::raytracing::RayTracedPoser`); the CPU only hands over the
+//! weights. Further off, it casts the shadow of the mesh unbent - in Wilderness the sway has all
+//! but faded out there. A mesh that bends is never put in with the still meshes, so coming within
 //! reach and going out of it again costs no cube put together again.
 //!
 //! Glass stands in light's way too, but lets it through, taking on its colour: a lamp shone
@@ -98,7 +97,7 @@ use fyrox::{
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 use fyrox_graphics_wgpu::{
     raytracing::{
-        CutoutMask, RayTracedGeometry, RayTracedInstance, RayTracedScene, ShadowRayLight,
+        CutoutMask, RayTracedGeometry, RayTracedInstance, RayTracedMorph, RayTracedPoser, RayTracedScene, ShadowRayLight,
         ShadowRayParameters, ShadowTracer,
     },
     server::WgpuGraphicsServer,
@@ -376,23 +375,27 @@ fn instance_transform(transform: &Matrix4<f32>) -> [f32; 12] {
 pub const SKIN_REACH: f32 = 30.0;
 
 /// How far from the camera a mesh bent by blend shapes is bent in its shadow too, in meters.
-pub const BEND_REACH: f32 = 25.0;
+pub const BEND_REACH: f32 = 40.0;
 
-/// How big a mesh has to be, in meters across at its widest, for its shadow to bend with it: a
-/// fern's sway is lost in its own shadow's softness, and a meadow of them would cost more to bend
-/// than all the trees round it.
-pub const BEND_SMALLEST: f32 = 3.0;
+/// How far, in meters, a bent mesh's vertices may have moved since its shadow's geometry was
+/// last bent before it is bent again: less than a soft shadow shows.
+pub const BEND_LEAST: f32 = 0.01;
 
-/// How many frames apart each bent mesh is bent again: they take turns.
-pub const BEND_EVERY: u64 = 3;
+/// The most bent meshes' geometry bent again in a frame: each is refitted, which costs the CPU a
+/// few microseconds in wgpu, and a forest holds thousands within reach. Those that have moved the
+/// furthest go first; the rest wait, their drift growing, until it is their turn.
+pub const BEND_BUDGET: usize = 512;
+
 
 /// A surface with blend shapes as its data has it, read once: where its vertices are in its own
-/// space, how far each shape moves each at full strength, and which of them its triangles use.
+/// space, and how far each shape moves each at full strength. Handed to the GPU to bend copies
+/// of its geometry by (`RayTracedMorph`).
 struct Bend {
     positions: Vec<Vector3<f32>>,
     /// Shape after shape, a vertex after vertex.
     offsets: Vec<Vec<Vector3<f32>>>,
-    used: Vec<u32>,
+    /// How far each shape moves the vertex it moves furthest, at full strength.
+    reach: Vec<f32>,
 }
 
 impl Bend {
@@ -409,28 +412,52 @@ impl Bend {
             (positions, count)
         };
         let (targets, morphs) = crate::yoctite::read_morphs(surface, count)?;
-        let offsets = (0..targets as usize)
+        let offsets: Vec<Vec<Vector3<f32>>> = (0..targets as usize)
             .map(|t| morphs.iter().map(|m| Vector3::new(m[t][0], m[t][1], m[t][2])).collect())
             .collect();
-        let mut used: Vec<u32> = triangles(surface, count);
-        used.sort_unstable();
-        used.dedup();
-        Some(Self { positions, offsets, used })
+        let reach = offsets.iter().map(|o: &Vec<Vector3<f32>>| o.iter().map(|o| o.norm()).fold(0.0, f32::max)).collect();
+        Some(Self { positions, offsets, reach })
+    }
+
+    /// At most how far its vertices have moved, in its own space, going from `from` weights to
+    /// `to` (none: unbent).
+    fn drift(&self, from: Option<&[f32]>, to: &[f32]) -> f32 {
+        let from = |t: usize| from.and_then(|f| f.get(t)).copied().unwrap_or(0.0);
+        to.iter().zip(&self.reach).enumerate().map(|(t, (w, r))| (w - from(t)).abs() * r).sum()
+    }
+
+    /// Its vertices unbent, three floats each.
+    fn flat_positions(&self) -> Vec<f32> {
+        self.positions.iter().flat_map(|p| [p.x, p.y, p.z]).collect()
+    }
+
+    /// How far each shape moves each vertex, three floats each, the shapes of a vertex together,
+    /// vertex after vertex: as `RayTracedMorph` keeps them.
+    fn flat_offsets(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.positions.len() * self.offsets.len() * 3);
+        for v in 0..self.positions.len() {
+            for shape in &self.offsets {
+                let o = shape[v];
+                out.extend_from_slice(&[o.x, o.y, o.z]);
+            }
+        }
+        out
     }
 
     /// Its vertices bent by `weights`, 1 a shape at full strength, in its own space, three floats
-    /// each. Those no triangle uses are left where they are.
+    /// each: as the GPU bends them, from what it is handed - for tests to tell it is right.
+    #[cfg(test)]
     fn pose(&self, weights: &[f32]) -> Vec<f32> {
-        let mut bent = self.positions.clone();
-        for (offsets, &weight) in self.offsets.iter().zip(weights) {
-            if weight == 0.0 {
-                continue;
-            }
-            for &v in &self.used {
-                bent[v as usize] += offsets[v as usize] * weight;
+        let (mut bent, offsets) = (self.flat_positions(), self.flat_offsets());
+        let targets = self.offsets.len();
+        for v in 0..self.positions.len() {
+            for (t, &weight) in weights.iter().enumerate().take(targets) {
+                for c in 0..3 {
+                    bent[v * 3 + c] += offsets[(v * targets + t) * 3 + c] * weight;
+                }
             }
         }
-        bent.iter().flat_map(|p| [p.x, p.y, p.z]).collect()
+        bent
     }
 }
 
@@ -708,6 +735,9 @@ pub struct TracedLightShadows {
     /// read); and the weights each bent surface was last bent by.
     bends: FxHashMap<u64, Option<Bend>>,
     bent: FxHashMap<Shape, Vec<f32>>,
+    /// Each surface with blend shapes on the GPU, by its data, and what bends copies of it.
+    morphs: FxHashMap<u64, Option<RayTracedMorph>>,
+    poser: Option<RayTracedPoser>,
     /// The cutout masks made so far, kept for as long as the scene is traced.
     masks: Masks,
     unsupported_reported: bool,
@@ -749,6 +779,8 @@ impl TracedLightShadows {
             poses: Default::default(),
             bends: Default::default(),
             bent: Default::default(),
+            morphs: Default::default(),
+            poser: None,
             masks: Default::default(),
             unsupported_reported: false,
         }
@@ -795,6 +827,7 @@ impl LightShadowTracer for TracedLightShadows {
             self.poses.clear();
             self.bends.clear();
             self.bent.clear();
+            self.morphs.clear();
             self.masks.clear();
             self.scene_handle = Some(scene_handle);
         }
@@ -814,6 +847,9 @@ impl LightShadowTracer for TracedLightShadows {
         let mut fixed = std::mem::take(&mut self.fixed);
         fixed.clear();
         let mut posed: FxHashMap<Shape, Vec<f32>> = FxHashMap::default();
+        // Bent geometry to bend this frame: which, whose blend shapes (by surface data), by what,
+        // and how far it has moved, in meters, since it was last bent.
+        let mut bend_jobs: Vec<(Shape, u64, Vec<f32>, f32)> = Vec::new();
         let mut what_blocks: FxHashMap<u64, Option<Blocks>> = FxHashMap::default();
         self.frame += 1;
         let frame = self.frame;
@@ -859,8 +895,9 @@ impl LightShadowTracer for TracedLightShadows {
             let weights: Vec<f32> = mesh.blend_shapes().iter().map(|s| s.weight / 100.0).collect();
             let bending = !weights.is_empty();
             let bend_near = bending
-                && camera.is_none_or(|camera| (node.global_position() - camera).norm() < BEND_REACH)
-                && mesh.world_bounding_box().half_extents().max() * 2.0 >= BEND_SMALLEST;
+                && camera.is_none_or(|camera| (node.global_position() - camera).norm() < BEND_REACH);
+            // How much the mesh is scaled up, at most: its drift is in its own space.
+            let scale = (0..3).map(|c| transform.fixed_view::<3, 1>(0, c).norm()).fold(0.0, f32::max);
             for (n, surface) in mesh.surfaces().iter().enumerate() {
                 let material = surface.material();
                 let masks = &mut self.masks;
@@ -870,20 +907,27 @@ impl LightShadowTracer for TracedLightShadows {
                 else {
                     continue;
                 };
-                let bend = if bend_near {
-                    let key = surface.data().key();
-                    self.bends.entry(key).or_insert_with(|| Bend::read(surface)).as_ref()
-                } else {
-                    None
+                let key = surface.data().key();
+                let has_morph = bend_near && {
+                    let device = &server.state.device;
+                    let bends = &mut self.bends;
+                    self.morphs
+                        .entry(key)
+                        .or_insert_with(|| {
+                            let bend = bends.entry(key).or_insert_with(|| Bend::read(surface)).as_ref()?;
+                            RayTracedMorph::new(device, &bend.flat_positions(), &bend.flat_offsets(), bend.offsets.len() as u32)
+                        })
+                        .is_some()
                 };
-                if let (true, Some(bend)) = (surface.bones().is_empty(), bend) {
-                    // Bent afresh in its turn, or the first time; between, as it was.
+                if surface.bones().is_empty() && has_morph {
+                    // Built unbent the first time, then bent on the GPU once it has moved enough to show.
                     let shape = Shape::Posed(handle, n);
-                    let built = self.geometry.contains_key(&shape);
-                    let turn = (frame + handle.index() as u64) % BEND_EVERY == 0;
-                    if !built || (turn && self.bent.get(&shape) != Some(&weights)) {
-                        posed.insert(shape, bend.pose(&weights));
-                        self.bent.insert(shape, weights.clone());
+                    let last = self.bent.get(&shape).map(Vec::as_slice);
+                    if let Some(Some(bend)) = self.bends.get(&key) {
+                        let drift = bend.drift(last, &weights) * scale;
+                        if drift >= BEND_LEAST {
+                            bend_jobs.push((shape, key, weights.clone(), drift));
+                        }
                     }
                     placed.push((shape, instance_transform(&transform), handle, n, how));
                     continue;
@@ -1026,6 +1070,29 @@ impl LightShadowTracer for TracedLightShadows {
             self.bent.retain(|shape, _| geometry.contains_key(shape));
         }
 
+        // Bent geometry, bent on the GPU and refitted.
+        let poser = self.poser.get_or_insert_with(|| RayTracedPoser::new(&server.state.device));
+        bend_jobs.retain(|(shape, ..)| self.geometry.contains_key(shape));
+        if bend_jobs.len() > BEND_BUDGET {
+            bend_jobs.select_nth_unstable_by(BEND_BUDGET, |a, b| b.3.total_cmp(&a.3));
+            bend_jobs.truncate(BEND_BUDGET);
+        }
+        let mut bends: Vec<(&RayTracedGeometry, &RayTracedMorph, &[f32])> = Vec::with_capacity(bend_jobs.len());
+        for (shape, key, weights, _) in &bend_jobs {
+            if let (Some(geometry), Some(Some(morph))) = (self.geometry.get(shape), self.morphs.get(key)) {
+                bends.push((geometry, morph, weights.as_slice()));
+            }
+        }
+        poser.pose(server, &bends)?;
+        let bent_any = !bends.is_empty();
+        for (shape, _, weights, _) in bend_jobs {
+            self.bent.insert(shape, weights);
+        }
+        if !same {
+            let kept: Vec<&RayTracedGeometry> = self.geometry.values().collect();
+            poser.forget_others(&kept);
+        }
+
         // Posed geometry, refitted where it is this frame.
         let updates: Vec<(&RayTracedGeometry, &[f32])> = posed
             .iter()
@@ -1043,6 +1110,7 @@ impl LightShadowTracer for TracedLightShadows {
             && fixed_same
             && built == 0
             && updates.is_empty()
+            && !bent_any
             && self.scene.borrow().is_some();
         // What was placed this frame is kept to tell against the next; last frame's, to be filled
         // again.
