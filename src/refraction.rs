@@ -14,6 +14,10 @@
 //! Glass takes no part in the G-buffer or in shadow maps: light passes through it, and what is
 //! behind it is lit as usual. Glass seen through other glass is not visible, because the copy is
 //! taken before any glass is drawn.
+//!
+//! Not only glass: any material whose shader has a `Refraction` pass is drawn in it, after the
+//! copy - water, say, bending the view of its bed. Such a shader binds the copy as `sceneColor`
+//! itself ([`scene_color`]).
 
 use fyrox::{
     asset::untyped::ResourceKind,
@@ -231,7 +235,20 @@ pub fn replace_materials(
     replaced
 }
 
-/// The render pass that draws glass. [`crate::GraphicsEffects`] installs it.
+/// Whether `shader` is drawn in the refraction pass: whether it has a pass of that name (the glass
+/// shader does).
+pub fn refracts(shader: &ShaderResource) -> bool {
+    if shader == &*GLASS_SHADER {
+        return true;
+    }
+    let state = shader.state();
+    state
+        .data_ref()
+        .is_some_and(|shader| shader.definition.passes.iter().any(|pass| pass.name == REFRACTION_PASS_NAME))
+}
+
+/// The render pass that draws glass, and whatever else refracts. [`crate::GraphicsEffects`]
+/// installs it.
 pub struct RefractionPass {
     source_type_id: TypeId,
     pass_name: ImmutableString,
@@ -305,7 +322,7 @@ impl SceneRenderPass for RefractionPass {
             let state = bundle.material.state();
             state
                 .data_ref()
-                .is_some_and(|material| material.shader() == &*GLASS_SHADER)
+                .is_some_and(|material| refracts(material.shader()))
         };
         if !ctx.bundle_storage.bundles.iter().any(is_glass) {
             return Ok(Default::default());
@@ -424,6 +441,20 @@ mod tests {
             group.property_ref("emissionStrength"),
             Some(fyrox::material::MaterialProperty::Float(strength)) if *strength == 2.0
         ));
+    }
+
+    #[test]
+    fn any_shader_with_a_refraction_pass_refracts() {
+        assert!(refracts(&glass_shader()));
+        // A shader of its own with a refraction pass, as water's.
+        let water = GLASS_WGSL.replace("FyroxGfxGlass", "Water");
+        let water = ShaderResource::new_ok(
+            fyrox::core::uuid::Uuid::new_v4(),
+            ResourceKind::Embedded,
+            Shader::from_string(&water).expect("parses"),
+        );
+        assert!(refracts(&water));
+        assert!(!refracts(&ShaderResource::standard()));
     }
 
     #[test]
