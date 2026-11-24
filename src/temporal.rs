@@ -50,9 +50,14 @@ const WGSL: &str = include_str!("shaders/taa_wgsl.shader");
 /// this, it was put somewhere else rather than moved there.
 const JUMP: f32 = 2.0;
 
-/// How much of each new frame goes into the result. Lower is smoother and slower to follow
-/// changes in lighting.
-const BLEND: f32 = 0.1;
+/// How much of each new frame goes into the result, the view standing still (moving, more: see
+/// the shader). Lower is smoother and slower to follow changes in lighting. Needles and leaves
+/// thinner than a pixel against the sky are a different colour in each frame's shifted view, and
+/// what of that each frame brings in shimmers: measured over 64 frames of a still view up into the
+/// crowns, the frame changed from frame to frame by 0.0050 (of 1, colours squeezed) at 0.1, 0.0035
+/// at this, 0.0030 at 0.03; a wider clamp, or the new frame counting less the more it differs,
+/// did little.
+const BLEND: f32 = 0.05;
 
 /// The view's shift for frame `frame`, in pixels, each way within half a pixel of the middle.
 /// A Halton sequence covers the pixel evenly in any run of consecutive frames.
