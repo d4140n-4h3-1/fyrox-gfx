@@ -71,7 +71,7 @@ use fyrox::{
     },
 };
 use fyrox_graphics_wgpu::{
-    candelite::{self, Bounds, ProbeFrame, RadianceCache, Reflections, ScreenProbes, SurfaceCache, SurfaceLight, SurfaceView, Sunlight, TraceScene, ViewShows},
+    candelite::{self, Bounds, Lamp, ProbeFrame, RadianceCache, Reflections, ScreenProbes, SurfaceCache, SurfaceLight, SurfaceView, Sunlight, TraceScene, ViewShows},
     server::WgpuGraphicsServer,
     texture::WgpuTexture,
     yoctite::{
@@ -1174,6 +1174,7 @@ impl YoctitePass {
             return Ok(Default::default());
         };
         // Lit already, in the G-Buffer pass, when it lights the frame.
+        light.set_lamps(&lamps_of(&ctx.bundle_storage.light_sources, eye));
         if self.candelite_shows == ViewShows::Lit && self.indirect.is_none() {
             light.update(device, &mut encoder, &mut candelite.scene, pool, &mut candelite.cache, eye, &sunlight);
             if light.is_full() && !candelite.full_reported {
@@ -1472,20 +1473,52 @@ mod tests {
     }
 }
 
+/// The lamps Candelite lights with besides the sun: the point and spot lights the frame is lit
+/// with, nearest `eye` first (it lights with [`candelite::MOST_LAMPS`]), each as the renderer
+/// lights with it - its colour linear times its intensity over pi, falling off to nothing at its
+/// reach, a spot's along its -y within its cone.
+fn lamps_of(lights: &[fyrox::renderer::bundle::LightSource], eye: [f32; 3]) -> Vec<Lamp> {
+    use fyrox::renderer::bundle::LightSourceKind;
+    let mut lamps: Vec<(f32, Lamp)> = lights
+        .iter()
+        .filter_map(|source| {
+            let light = linear(source.color).map(|c| c * source.intensity / std::f32::consts::PI);
+            let (reach, spot) = match source.kind {
+                LightSourceKind::Point { radius, .. } => (radius, None),
+                LightSourceKind::Spot { full_cone_angle, hotspot_cone_angle, distance, .. } => {
+                    let toward = (-source.up_vector).try_normalize(f32::EPSILON)?;
+                    (distance, Some((toward.into(), (full_cone_angle * 0.5).cos(), (hotspot_cone_angle * 0.5).cos())))
+                }
+                _ => return None,
+            };
+            if reach <= 0.0 || light.iter().all(|&c| c <= 0.0) {
+                return None;
+            }
+            let position: [f32; 3] = source.position.into();
+            let distance = (0..3).map(|i| (position[i] - eye[i]).powi(2)).sum::<f32>().sqrt();
+            Some((distance, Lamp { position, reach, light, spot }))
+        })
+        .collect();
+    lamps.sort_by(|a, b| a.0.total_cmp(&b.0));
+    lamps.into_iter().map(|(_, lamp)| lamp).collect()
+}
+
+/// An sRGB colour, linear.
+fn linear(c: fyrox::core::color::Color) -> [f32; 3] {
+    [c.r, c.g, c.b].map(|c| {
+        let c = c as f32 / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    })
+}
+
 /// The light Candelite lights with: the scene's first directional light - its up vector towards
 /// the sun, as the renderer lights with it, its colour linear times its intensity over pi, as the
 /// renderer's diffuse lighting gives off - and the sky, its ambient lighting colour, linear.
 fn sunlight_of(scene: &Scene) -> Sunlight {
-    let linear = |c: fyrox::core::color::Color| {
-        [c.r, c.g, c.b].map(|c| {
-            let c = c as f32 / 255.0;
-            if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        })
-    };
     let sky = linear(scene.rendering_options.ambient_lighting_color);
     match scene.graph.linear_iter().find_map(|node| node.cast::<DirectionalLight>()) {
         Some(sun) => {
@@ -1591,6 +1624,7 @@ fn gather(
         let scale = (CACHE_MS / ms.max(0.05)).powf(0.25).clamp(0.7, 1.1);
         radiance.set_budget(((radiance.budget() as f32 * scale) as usize).max(CACHE_LEAST));
     }
+    light.set_lamps(&lamps_of(ctx.light_sources, eye));
     light.update(device, &mut encoder, &mut candelite.scene, pool, &mut candelite.cache, eye, &sunlight);
     server.gpu_mark_in(&mut encoder, "Candelite: cards lit");
     radiance.update(device, &mut encoder, &mut candelite.scene, pool, &mut candelite.cache, light, eye, &sunlight);
