@@ -54,6 +54,8 @@ pub mod reflections;
 pub mod refraction;
 mod scene_copy;
 pub mod shadows;
+#[cfg(feature = "raytracing")]
+pub mod support;
 pub mod temporal;
 #[cfg(feature = "raytracing")]
 pub mod yoctite;
@@ -503,11 +505,42 @@ impl Plugin for GraphicsEffects {
                 self.temporal_pass = Some(pass);
             }
             // After everything, temporal smoothing too, so its colours are its own.
+            // Only where the card can run them (see [`support`]): elsewhere the renderer draws every
+            // mesh itself, and lights the scene with its flat ambient colour.
             #[cfg(feature = "raytracing")]
-            if let Some(mode) = self
-                .yoctite
-                .filter(|_| raytraced_shadows::is_supported_backend(graphics_context.renderer.graphics_server()))
-            {
+            let support = self.yoctite.map(|_| {
+                graphics_context
+                    .renderer
+                    .graphics_server()
+                    .as_any()
+                    .downcast_ref::<fyrox_graphics_wgpu::server::WgpuGraphicsServer>()
+                    .map(|server| support::Support::of(&server.state.adapter, &server.state.device))
+                    .unwrap_or_else(|| {
+                        let why = "they need the wgpu backend".to_string();
+                        support::Support { yoctite: Err(why.clone()), candelite: Err(why) }
+                    })
+            });
+            #[cfg(feature = "raytracing")]
+            let wants_candelite = self.candelite || self.candelite_view;
+            #[cfg(feature = "raytracing")]
+            match (self.yoctite, &support) {
+                (Some(_), Some(support::Support { yoctite: Err(why), .. })) => fyrox::core::log::Log::warn(format!(
+                    "Yoctite is off: {why}. The renderer draws every mesh itself{}.",
+                    if wants_candelite { ", and Candelite is off with it: the scene is lit with its flat ambient colour" } else { "" }
+                )),
+                (Some(_), Some(support::Support { candelite: Err(why), .. })) if wants_candelite => fyrox::core::log::Log::warn(format!(
+                    "Candelite is off: {why}. Yoctite draws the scene, lit with its flat ambient colour."
+                )),
+                (Some(_), Some(_)) => fyrox::core::log::Log::info(if wants_candelite {
+                    "Yoctite draws the scene, and Candelite lights it: the graphics card runs both."
+                } else {
+                    "Yoctite draws the scene: the graphics card runs it."
+                }),
+                _ => {}
+            }
+            #[cfg(feature = "raytracing")]
+            if let (Some(mode), Some(support::Support { yoctite: Ok(()), candelite })) = (self.yoctite, support) {
+                let candelite = candelite.is_ok();
                 // Drawing in place of the renderer, it tells the renderer which meshes it draws.
                 let taken_over = (mode == yoctite::Mode::Render).then(|| {
                     let set = fyrox::renderer::TakenOverMeshes::default();
@@ -515,12 +548,12 @@ impl Plugin for GraphicsEffects {
                     set
                 });
                 let mut pass = yoctite::YoctitePass::new(TypeId::of::<Self>(), mode, taken_over);
-                if self.candelite_light {
+                if candelite && self.candelite_light {
                     pass.show_candelite_light();
-                } else if self.candelite_view {
+                } else if candelite && self.candelite_view {
                     pass.show_candelite();
                 }
-                if self.candelite {
+                if self.candelite && candelite {
                     let indirect = fyrox::renderer::IndirectDiffuse::default();
                     let specular = fyrox::renderer::IndirectSpecular::default();
                     graphics_context.renderer.set_indirect_diffuse(Some(indirect.clone()));

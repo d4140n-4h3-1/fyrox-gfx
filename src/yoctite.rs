@@ -420,8 +420,7 @@ const CACHE_MS: f32 = 1.0;
 /// The fewest probes of Candelite's radiance cache traced a frame.
 const CACHE_LEAST: usize = 32;
 
-/// How many texels square Candelite's atlas is.
-const ATLAS_SIZE: u32 = 2048;
+use crate::support::ATLAS_SIZE;
 
 /// Yoctite in the renderer: see the module's description. [`crate::GraphicsEffects::with_yoctite`]
 /// and [`crate::GraphicsEffects::with_yoctite_view`] add it.
@@ -462,6 +461,22 @@ impl YoctitePass {
             candelite_overlay: false,
             candelite_shows: ViewShows::Shaded,
             indirect: None,
+        }
+    }
+
+    /// Turns Candelite off for good, after it failed: its cards and traced scenes dropped, and the
+    /// light it gathered taken back from the renderer, which lights every scene with its flat
+    /// ambient colour again. Yoctite keeps drawing.
+    fn turn_off_candelite(&mut self) {
+        Log::warn("Candelite is off from now on: the scene is lit with its flat ambient colour.");
+        self.candelite = false;
+        self.candelite_overlay = false;
+        if let Some((indirect, specular)) = self.indirect.take() {
+            indirect.borrow_mut().clear();
+            specular.borrow_mut().clear();
+        }
+        for scene in self.scenes.values_mut() {
+            scene.candelite = None;
         }
     }
 
@@ -1282,6 +1297,7 @@ impl SceneRenderPass for YoctitePass {
             }
         };
         // Candelite's new captures, into its cache; and what it traces against, kept in step.
+        let mut candelite_failed = false;
         if let Some(candelite) = scene.candelite.as_mut() {
             server.flush_active_pass();
             let mut encoder = server.frame_encoder.borrow_mut().take().unwrap_or_else(|| {
@@ -1293,6 +1309,7 @@ impl SceneRenderPass for YoctitePass {
                 });
                 if let Err(err) = captured {
                     Log::err(format!("Candelite could not capture its cards: {err:?}"));
+                    candelite_failed = true;
                 }
                 candelite.pending.clear();
             }
@@ -1302,6 +1319,7 @@ impl SceneRenderPass for YoctitePass {
             if let Some((indirect, specular)) = &self.indirect {
                 if let Err(err) = gather(server, candelite, pool, &ctx, indirect, specular) {
                     Log::err(format!("Candelite could not light the frame: {err:?}"));
+                    candelite_failed = true;
                 }
             }
         }
@@ -1328,6 +1346,9 @@ impl SceneRenderPass for YoctitePass {
         let mut stats = RenderPassStatistics::default();
         stats.draw_calls += draws.draw_calls as usize;
         stats.triangles_rendered += triangles;
+        if candelite_failed {
+            self.turn_off_candelite();
+        }
         Ok(stats)
     }
 

@@ -1620,6 +1620,7 @@ dependencies = [
  "fyrox",
  "fyrox-graphics-wgpu",
  "half",
+ "wgpu",
  "yoctite",
 ]
 
