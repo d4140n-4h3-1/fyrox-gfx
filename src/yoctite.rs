@@ -377,6 +377,12 @@ struct SceneMeshes {
     waiting: FxHashSet<Handle<Node>>,
     /// Where the look over a slice of every node a frame has got to (see [`SWEEP`]).
     sweep: u32,
+    /// Mesh nodes the pool had no room for on this GPU (see `GeometryPool::add_mesh`): left to
+    /// the renderer, and not tried again until something gives room back.
+    refused: FxHashSet<Handle<Node>>,
+    refused_reported: bool,
+    /// How many vertex slots the pool had in use when it last refused one.
+    refused_at: u32,
 }
 
 /// How many of the graph's node slots are looked at each frame besides those its change journal
@@ -790,6 +796,9 @@ impl SceneMeshes {
             journal,
             waiting,
             sweep,
+            refused,
+            refused_reported,
+            refused_at,
             ..
         } = self;
         let pool = pool.get_or_insert_with(|| GeometryPool::new(device, 1 << 16));
@@ -807,6 +816,8 @@ impl SceneMeshes {
         let mut uploaded = 0;
         let mut bending = 0;
         let mut changed = false;
+        // Whether a node was refused this time, leaving meshes uploaded for it unused.
+        let mut refused_now = false;
         // Which nodes to look at: every one, the first time or when the graph's change journal
         // no longer reaches back to the last look; else those it names, those waiting, and a
         // slice of every slot in turn.
@@ -843,6 +854,10 @@ impl SceneMeshes {
             // Those hidden and those drawn forward stay the renderer's.
             if !node.global_visibility() || mesh.render_path() != RenderPath::Deferred {
                 gone.push(handle);
+                continue;
+            }
+            // Too much for the pool on this GPU: the renderer's, as one Yoctite cannot draw is.
+            if refused.contains(&handle) {
                 continue;
             }
             let surfaces = mesh.surfaces();
@@ -921,6 +936,7 @@ impl SceneMeshes {
                 continue;
             }
             waiting.remove(&handle);
+            let mut fits = true;
             for (n, surface) in surfaces.iter().enumerate() {
                 let data = surface.data().key();
                 // A mesh uploaded now, for Candelite: its triangles and full-detail clusters.
@@ -946,7 +962,7 @@ impl SceneMeshes {
                         });
                         uploaded += 1;
                         bending += morphs.is_some() as usize;
-                        let mesh = pool.add_morphing_mesh(
+                        let Some(mesh) = pool.add_morphing_mesh(
                             device,
                             queue,
                             &dag,
@@ -956,7 +972,10 @@ impl SceneMeshes {
                                 offsets,
                                 most_weight: MOST_WEIGHT,
                             }),
-                        );
+                        ) else {
+                            fits = false;
+                            break;
+                        };
                         place.insert(Built { mesh, dag }).mesh
                     }
                 };
@@ -993,10 +1012,34 @@ impl SceneMeshes {
                         None => {}
                     }
                 }
-                let instance = pool.add_instance(device, queue, mesh, rows(&transform), slot);
+                let Some(instance) = pool.add_instance(device, queue, mesh, rows(&transform), slot) else {
+                    if rendering {
+                        materials.give_back(material);
+                    }
+                    fits = false;
+                    break;
+                };
                 drawn.weights = mesh_weights(node);
                 pool.set_weights(instance, &drawn.weights);
                 drawn.placed.push(Placed { instance, data, material });
+            }
+            if !fits {
+                // What of it was placed goes, and the whole node is left to the renderer, which
+                // draws it as it would without Yoctite.
+                if let Some(old) = nodes.remove(&handle) {
+                    release(pool, materials, &old);
+                }
+                refused.insert(handle);
+                refused_now = true;
+                *refused_at = pool.vertices.used();
+                if !*refused_reported {
+                    Log::warn(format!(
+                        "Yoctite: this GPU cannot bind a pool bigger than {:.0} MB; meshes past that are drawn by the renderer instead",
+                        fyrox_graphics_wgpu::yoctite::storage_binding_limit(device) as f64 / 1048576.0
+                    ));
+                    *refused_reported = true;
+                }
+                continue;
             }
             drawn.transform = transform;
             changed |= taken_over.insert(handle);
@@ -1019,9 +1062,11 @@ impl SceneMeshes {
                 keep
             });
             waiting.retain(|handle| nodes.contains_key(handle));
+            refused.retain(|handle| graph.try_get_node(*handle).is_ok());
         } else {
             for handle in gone {
                 waiting.remove(&handle);
+                refused.remove(&handle);
                 if let Some(drawn) = nodes.remove(&handle) {
                     release(pool, materials, &drawn);
                     changed |= taken_over.remove(&handle);
@@ -1029,7 +1074,13 @@ impl SceneMeshes {
                 }
             }
         }
-        if removed {
+        // Enough room given back - an eighth of what the GPU can bind - and those refused are
+        // tried again. Not for every plant that goes: a forest's floor comes and goes all the
+        // time, and trying again each time would cost a failed upload every frame.
+        if removed && !refused.is_empty() && pool.vertices.used() + pool.vertices.limit() / 8 <= *refused_at {
+            refused.clear();
+        }
+        if removed || refused_now {
             // Meshes nothing is placed from any more go, giving back their room in the pool.
             let used: FxHashSet<u64> = nodes.values().flat_map(|d| d.placed.iter().map(|p| p.data)).collect();
             built.retain(|data, built| {
