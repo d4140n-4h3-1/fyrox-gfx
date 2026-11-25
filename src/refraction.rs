@@ -369,6 +369,9 @@ impl SceneRenderPass for RefractionPass {
                 light_position: &Default::default(),
                 ambient_light: ctx.scene.rendering_options.ambient_lighting_color,
                 scene_depth: Some(ctx.depth_texture),
+                // The glass reads its own copy of the frame (`sceneColor`), taken after the
+                // forward pass; the renderer's opaque copy is for forward materials.
+                scene_color: None,
                 renderer_resources: ctx.renderer_resources,
             },
         );
